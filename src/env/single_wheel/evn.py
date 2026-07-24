@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 
 from brax.envs.base import Env, State
-from src.env.reward_fn import compute_reward_1d
+from src.env.single_wheel.reward import compute_reward
 
 I_satellite = 2.0
 J_wheel = 0.05
@@ -12,7 +12,7 @@ b_friction = 0.001
 OMEGA_MAX = 628.0
 
 @jax.jit
-def step_1d(state, action, dt=0.01):
+def step(state, action, dt=0.01):
     """
     Simplified 1D physics: one wheel is used to control rotation in a single plane.
     Satellites dyamics is inverse wheel rotation: a torque applied at a wheel makes 
@@ -90,12 +90,12 @@ class Satellite1DEnv(Env):
         target = phys["target"]
         
         action_scalar = jnp.squeeze(action)
-        next_omega, next_theta, next_omega_w = step_1d(current_state, action_scalar, self._dt)
+        next_omega, next_theta, next_omega_w = step(current_state, action_scalar, self._dt)
         plain_err = target - next_theta
         angle_err = (plain_err + jnp.pi) % (2 * jnp.pi) - jnp.pi
         abs_ang_err = jnp.abs(angle_err)
         
-        total_reward, rews = compute_reward_1d(action_scalar, next_omega, abs_ang_err)
+        total_reward, rews = compute_reward(action_scalar, next_omega, abs_ang_err)
         r_att, r_omega, _ = rews
 
         next_physics = {"omega": next_omega, "theta": next_theta, "omega_w": next_omega_w, "target": target}
