@@ -7,6 +7,7 @@ import numpy as np
 import jax.numpy as jnp
 from time import time
 from src.env.single_wheel.evn import Satellite1DEnv
+from src.env.single_wheel.visualisation import save_simulation_video
 
 from src.env.single_wheel.algo import ActorCritic
 from typing import NamedTuple
@@ -216,7 +217,8 @@ def launch():
             result = np.abs(fin_test_env_states.metrics['r_att'] / (10.))
             print(f"Epoque {epoch} | loss : {loss_value:.6f} | return mean: {np.mean(result):.7f} / med: {np.median(result):.7f} | took {time()-elapsed:.2f} sec")
             elapsed = time()
-            
+            save_simulation_video(np.array(observations), target, output_filename=f"results/single_wheel_task_{epoch}.mp4", fps=20)
+
 
 if __name__=='__main__':
     launch()
