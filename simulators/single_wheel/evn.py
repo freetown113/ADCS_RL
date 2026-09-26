@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 
 from brax.envs.base import Env, State
-from src.env.single_wheel.reward import compute_reward
+from simulators.single_wheel.reward import compute_reward
 
 I_satellite = 2.0
 J_wheel = 0.05

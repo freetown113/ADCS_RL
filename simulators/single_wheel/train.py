@@ -6,10 +6,10 @@ import functools
 import numpy as np
 import jax.numpy as jnp
 from time import time
-from src.env.single_wheel.evn import Satellite1DEnv
-from src.env.single_wheel.visualisation import save_simulation_video
+from simulators.single_wheel.evn import Satellite1DEnv
+from simulators.single_wheel.visualisation import save_simulation_video
 
-from src.env.single_wheel.algo import ActorCritic
+from simulators.single_wheel.algo import ActorCritic
 from typing import NamedTuple
 
 
