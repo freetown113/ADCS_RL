@@ -1,6 +1,3 @@
-"""Nominal, residual, and teacher control mappings."""
-from __future__ import annotations
-
 import jax
 import jax.numpy as jnp
 
@@ -23,8 +20,14 @@ def pd_gains(env: SatelliteEnv) -> tuple[jax.Array, jax.Array]:
 def normalized_pd_body_action(env: SatelliteEnv, state: EnvState) -> jax.Array:
     """Three normalized body-torque commands produced by the PD controller."""
     kp, kd = pd_gains(env)
-    error_q = attitude_error(state.target_q, state.physical.q)
-    desired_torque = -kp * error_q[..., 1:] - kd * state.sensors.gyro
+    if env.config.estimator.enabled:
+        attitude_q = state.estimator.q
+        omega = state.estimator.omega
+    else:
+        attitude_q = state.physical.q
+        omega = state.sensors.gyro
+    error_q = attitude_error(state.target_q, attitude_q)
+    desired_torque = -kp * error_q[..., 1:] - kd * omega
     torque_limit = jnp.asarray(
         env.config.physics.body_torque_limit, dtype=desired_torque.dtype
     )

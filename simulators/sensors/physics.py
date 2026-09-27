@@ -35,7 +35,7 @@ class ActuationInfo(NamedTuple):
 
 
 def body_inertia(config: PhysicsConfig, dtype=jnp.float32) -> jax.Array:
-    return jnp.diag(jnp.asjax.Array(config.body_inertia, dtype=dtype))
+    return jnp.diag(jnp.asarray(config.body_inertia, dtype=dtype))
 
 
 def body_inertia_inv(config: PhysicsConfig, dtype=jnp.float32) -> jax.Array:

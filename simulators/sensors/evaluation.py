@@ -1,6 +1,3 @@
-"""Deterministic evaluation and classical-controller baselines."""
-from __future__ import annotations
-
 from typing import Callable, NamedTuple
 
 import haiku as hk
@@ -10,6 +7,7 @@ import jax.numpy as jnp
 from simulators.sensors.control import pd_command_action, policy_to_command
 from simulators.sensors.env import EnvState, SatelliteEnv
 from simulators.sensors.ppo import deterministic_action
+from simulators.sensors.math3d import attitude_angle, attitude_error
 
 
 class EvaluationTrajectory(NamedTuple):
@@ -35,6 +33,17 @@ class EvaluationTrajectory(NamedTuple):
     magnetometer_age_seconds: jax.Array
     sun_sensor_age_seconds: jax.Array
     gnss_age_seconds: jax.Array
+    estimated_q: jax.Array
+    estimated_omega: jax.Array
+    estimated_gyro_bias: jax.Array
+    estimator_attitude_sigma_rad: jax.Array
+    estimator_bias_sigma_rad_s: jax.Array
+    star_tracker_nis: jax.Array
+    magnetometer_nis: jax.Array
+    sun_sensor_nis: jax.Array
+    star_tracker_update_accepted: jax.Array
+    magnetometer_update_accepted: jax.Array
+    sun_sensor_update_accepted: jax.Array
     wheel_mask: jax.Array
     policy_action: jax.Array
     command_action: jax.Array
@@ -94,6 +103,17 @@ def rollout_command_controller(
             magnetometer_age_seconds=info.magnetometer_age_seconds,
             sun_sensor_age_seconds=info.sun_sensor_age_seconds,
             gnss_age_seconds=info.gnss_age_seconds,
+            estimated_q=info.estimated_q,
+            estimated_omega=info.estimated_omega,
+            estimated_gyro_bias=info.estimated_gyro_bias,
+            estimator_attitude_sigma_rad=info.estimator_attitude_sigma_rad,
+            estimator_bias_sigma_rad_s=info.estimator_bias_sigma_rad_s,
+            star_tracker_nis=info.star_tracker_nis,
+            magnetometer_nis=info.magnetometer_nis,
+            sun_sensor_nis=info.sun_sensor_nis,
+            star_tracker_update_accepted=info.star_tracker_update_accepted,
+            magnetometer_update_accepted=info.magnetometer_update_accepted,
+            sun_sensor_update_accepted=info.sun_sensor_update_accepted,
             wheel_mask=info.wheel_mask,
             policy_action=zeros,
             command_action=command,
@@ -143,6 +163,17 @@ def evaluate_policy(
             magnetometer_age_seconds=info.magnetometer_age_seconds,
             sun_sensor_age_seconds=info.sun_sensor_age_seconds,
             gnss_age_seconds=info.gnss_age_seconds,
+            estimated_q=info.estimated_q,
+            estimated_omega=info.estimated_omega,
+            estimated_gyro_bias=info.estimated_gyro_bias,
+            estimator_attitude_sigma_rad=info.estimator_attitude_sigma_rad,
+            estimator_bias_sigma_rad_s=info.estimator_bias_sigma_rad_s,
+            star_tracker_nis=info.star_tracker_nis,
+            magnetometer_nis=info.magnetometer_nis,
+            sun_sensor_nis=info.sun_sensor_nis,
+            star_tracker_update_accepted=info.star_tracker_update_accepted,
+            magnetometer_update_accepted=info.magnetometer_update_accepted,
+            sun_sensor_update_accepted=info.sun_sensor_update_accepted,
             wheel_mask=info.wheel_mask,
             policy_action=policy_action,
             command_action=command,
@@ -173,7 +204,13 @@ def summarize_trajectory(env: SatelliteEnv, trajectory: EvaluationTrajectory) ->
     final_second_steps = max(
         1, int(round(1.0 / env.config.physics.control_dt))
     )
-
+    estimator_attitude_error = attitude_angle(
+        attitude_error(trajectory.q, trajectory.estimated_q)
+    )
+    estimator_rate_error = jnp.linalg.norm(
+        trajectory.omega - trajectory.estimated_omega, axis=-1
+    )
+    
     return {
         "episode_return_mean": jnp.mean(episode_return),
         "episode_return_median": jnp.median(episode_return),
@@ -227,6 +264,28 @@ def summarize_trajectory(env: SatelliteEnv, trajectory: EvaluationTrajectory) ->
             trajectory.sun_sensor_age_seconds
         ),
         "gnss_sample_age_max_seconds": jnp.max(trajectory.gnss_age_seconds),
+        "estimator_attitude_error_deg_mean": jnp.mean(
+            jnp.rad2deg(estimator_attitude_error)
+        ),
+        "estimator_attitude_error_deg_max": jnp.max(
+            jnp.rad2deg(estimator_attitude_error)
+        ),
+        "estimator_rate_error_mean": jnp.mean(estimator_rate_error),
+        "estimator_attitude_sigma_deg_mean": jnp.mean(
+            jnp.rad2deg(trajectory.estimator_attitude_sigma_rad)
+        ),
+        "estimator_bias_sigma_mean": jnp.mean(
+            trajectory.estimator_bias_sigma_rad_s
+        ),
+        "star_tracker_update_acceptance": jnp.mean(
+            trajectory.star_tracker_update_accepted.astype(jnp.float32)
+        ),
+        "magnetometer_update_acceptance": jnp.mean(
+            trajectory.magnetometer_update_accepted.astype(jnp.float32)
+        ),
+        "sun_sensor_update_acceptance": jnp.mean(
+            trajectory.sun_sensor_update_accepted.astype(jnp.float32)
+        ),
         "allocation_error_max": jnp.max(trajectory.allocation_error),
         "wheel_failure_fraction": jnp.mean(
             jnp.any(trajectory.wheel_mask < 0.5, axis=-1).astype(jnp.float32)

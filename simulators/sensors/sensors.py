@@ -139,7 +139,7 @@ def reset_sensor_state(
     eclipse = earth_eclipse_mask(
         orbit.position_eci_m, orbit.sun_direction_eci, orbit_config
     )
-    sun_available = (~eclipse)
+    sun_available = (~eclipse) | (not config.sun_sensor_eclipse_enabled)
     sun_valid_initial = sun_immediate & sun_available
 
     def scalar_valid(value: bool) -> jax.Array:
@@ -287,7 +287,7 @@ def sensor_substep(
     sun_eci = sun_direction_eci(orbit_config, sun_position.dtype)
     sun_eci = jnp.broadcast_to(sun_eci, sun_position.shape)
     eclipsed = earth_eclipse_mask(sun_position, sun_eci, orbit_config)
-    sun_available = (~eclipsed) | (~config.sun_sensor_eclipse_enabled)
+    sun_available = (~eclipsed) | (not config.sun_sensor_eclipse_enabled)
     sun_packet_valid = sun_due & sun_available
 
     gnss_position_candidate = position_history[-1 - gnss_latency]

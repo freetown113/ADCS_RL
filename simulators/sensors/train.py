@@ -214,6 +214,14 @@ def parse_config() -> ExperimentConfig:
     parser.add_argument("--sun-sensor-eclipse", action="store_true")
     parser.add_argument("--orbit-altitude-m", type=float, default=None)
     parser.add_argument("--orbit-inclination-deg", type=float, default=None)
+    parser.add_argument("--disable-estimator", action="store_true")
+    parser.add_argument("--disable-star-tracker-update", action="store_true")
+    parser.add_argument("--disable-magnetometer-update", action="store_true")
+    parser.add_argument("--disable-sun-sensor-update", action="store_true")
+    parser.add_argument("--disable-latency-compensation", action="store_true")
+    parser.add_argument("--star-tracker-nis-gate", type=float, default=None)
+    parser.add_argument("--magnetometer-nis-gate", type=float, default=None)
+    parser.add_argument("--sun-sensor-nis-gate", type=float, default=None)
     args = parser.parse_args()
 
     config = default_config()
@@ -341,6 +349,31 @@ def parse_config() -> ExperimentConfig:
                 config.orbit, inclination_deg=args.orbit_inclination_deg
             )
         )
+    if args.disable_estimator:
+        config = replace(
+            config, estimator=replace(config.estimator, enabled=False)
+        )
+    estimator_boolean_overrides = {
+        "use_star_tracker": not args.disable_star_tracker_update,
+        "use_magnetometer": not args.disable_magnetometer_update,
+        "use_sun_sensor": not args.disable_sun_sensor_update,
+        "compensate_fixed_latency": not args.disable_latency_compensation,
+    }
+    for name, value in estimator_boolean_overrides.items():
+        if value is False:
+            config = replace(
+                config, estimator=replace(config.estimator, **{name: value})
+            )
+    estimator_scalar_overrides = {
+        "star_tracker_nis_gate": args.star_tracker_nis_gate,
+        "magnetometer_nis_gate": args.magnetometer_nis_gate,
+        "sun_sensor_nis_gate": args.sun_sensor_nis_gate,
+    }
+    for name, value in estimator_scalar_overrides.items():
+        if value is not None:
+            config = replace(
+                config, estimator=replace(config.estimator, **{name: value})
+            )
     return config
 
 

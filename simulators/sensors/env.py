@@ -4,6 +4,13 @@ import jax
 import jax.numpy as jnp
 
 from simulators.sensors.config import ExperimentConfig, validate_config
+from simulators.sensors.estimator import (
+    EstimatorState,
+    attitude_sigma_rad,
+    estimator_substep,
+    gyro_bias_sigma_rad_s,
+    reset_estimator_state,
+)
 from simulators.sensors.math3d import attitude_error, axis_angle_to_quat, sample_quaternion_in_cone
 from simulators.sensors.orbit import OrbitState, orbit_substep, reset_orbit_state
 from simulators.sensors.physics import (
@@ -24,6 +31,7 @@ class EnvState(NamedTuple):
     physical: PhysicalState
     orbit: OrbitState
     sensors: SensorState
+    estimator: EstimatorState
     target_q: jax.Array
     wheel_mask: jax.Array
     previous_action: jax.Array
@@ -34,6 +42,14 @@ class EnvState(NamedTuple):
     fault_end_step: jax.Array
     fault_key: jax.Array
 
+
+class EstimatorEvents(NamedTuple):
+    star_tracker_processed: jax.Array
+    magnetometer_processed: jax.Array
+    sun_sensor_processed: jax.Array
+    star_tracker_accepted: jax.Array
+    magnetometer_accepted: jax.Array
+    sun_sensor_accepted: jax.Array
 
 class StepInfo(NamedTuple):
     reward_terms: RewardTerms
@@ -62,6 +78,20 @@ class StepInfo(NamedTuple):
     magnetometer_age_seconds: jax.Array
     sun_sensor_age_seconds: jax.Array
     gnss_age_seconds: jax.Array
+    estimated_q: jax.Array
+    estimated_omega: jax.Array
+    estimated_gyro_bias: jax.Array
+    estimator_attitude_sigma_rad: jax.Array
+    estimator_bias_sigma_rad_s: jax.Array
+    star_tracker_nis: jax.Array
+    magnetometer_nis: jax.Array
+    sun_sensor_nis: jax.Array
+    star_tracker_update_processed: jax.Array
+    magnetometer_update_processed: jax.Array
+    sun_sensor_update_processed: jax.Array
+    star_tracker_update_accepted: jax.Array
+    magnetometer_update_accepted: jax.Array
+    sun_sensor_update_accepted: jax.Array
 
 
 class SatelliteEnv:
@@ -254,10 +284,12 @@ class SatelliteEnv:
             self.config.physics,
             self.config.orbit,
         )
+        estimator = reset_estimator_state(sensors, self.config.estimator)
         return EnvState(
             physical=physical,
             orbit=orbit,
             sensors=sensors,
+            estimator=estimator,
             target_q=target_q,
             wheel_mask=wheel_mask,
             previous_action=jnp.zeros(
@@ -272,9 +304,16 @@ class SatelliteEnv:
         )
 
     def observe(self, state: EnvState) -> jax.Array:
-        error_q = attitude_error(state.target_q, state.physical.q)
+        if self.config.estimator.enabled:
+            attitude_q = state.estimator.q
+            omega = state.estimator.omega
+        else:
+            attitude_q = state.physical.q
+            omega = state.sensors.gyro
+
+        error_q = attitude_error(state.target_q, attitude_q)
         attitude_vector = 2.0 * error_q[..., 1:]
-        normalized_omega = state.sensors.gyro / self.config.observation.omega_scale
+        normalized_omega = omega / self.config.observation.omega_scale
         normalized_wheel_speed = (
             state.sensors.wheel_speed / self.config.physics.max_wheel_speed
         )
@@ -305,7 +344,7 @@ class SatelliteEnv:
             commanded_motor_torque = action * p.motor_control_limit
 
             def substep(carry, substep_index):
-                physical, orbit, sensors = carry
+                physical, orbit, sensors, estimator = carry
                 next_physical, actuation = physics_substep_motor_direct(
                     physical,
                     commanded_motor_torque,
@@ -324,13 +363,61 @@ class SatelliteEnv:
                     p,
                     self.config.orbit,
                 )
-                return (next_physical, next_orbit, next_sensors), actuation
+                if self.config.estimator.enabled:
+                    next_estimator = estimator_substep(
+                        estimator,
+                        next_sensors,
+                        absolute_step,
+                        p,
+                        self.config.orbit,
+                        self.config.estimator,
+                    )
+                else:
+                    next_estimator = estimator
+                events = EstimatorEvents(
+                    star_tracker_processed=(
+                        next_estimator.last_star_tracker_step
+                        > estimator.last_star_tracker_step
+                    ),
+                    magnetometer_processed=(
+                        next_estimator.last_magnetometer_step
+                        > estimator.last_magnetometer_step
+                    ),
+                    sun_sensor_processed=(
+                        next_estimator.last_sun_sensor_step
+                        > estimator.last_sun_sensor_step
+                    ),
+                    star_tracker_accepted=(
+                        next_estimator.star_tracker_update_accepted
+                        & (
+                            next_estimator.last_star_tracker_step
+                            > estimator.last_star_tracker_step
+                        )
+                    ),
+                    magnetometer_accepted=(
+                        next_estimator.magnetometer_update_accepted
+                        & (
+                            next_estimator.last_magnetometer_step
+                            > estimator.last_magnetometer_step
+                        )
+                    ),
+                    sun_sensor_accepted=(
+                        next_estimator.sun_sensor_update_accepted
+                        & (
+                            next_estimator.last_sun_sensor_step
+                            > estimator.last_sun_sensor_step
+                        )
+                    ),
+                )
+                return (
+                    next_physical, next_orbit, next_sensors, next_estimator
+                ), (actuation, events)
         else:
             torque_limit = jnp.asarray(p.body_torque_limit, dtype=action.dtype)
             desired_body_torque = action * torque_limit
 
             def substep(carry, substep_index):
-                physical, orbit, sensors = carry
+                physical, orbit, sensors, estimator = carry
                 next_physical, actuation = physics_substep(
                     physical,
                     desired_body_torque,
@@ -350,13 +437,67 @@ class SatelliteEnv:
                     p,
                     self.config.orbit,
                 )
-                return (next_physical, next_orbit, next_sensors), actuation
+                if self.config.estimator.enabled:
+                    next_estimator = estimator_substep(
+                        estimator,
+                        next_sensors,
+                        absolute_step,
+                        p,
+                        self.config.orbit,
+                        self.config.estimator,
+                    )
+                else:
+                    next_estimator = estimator
+                events = EstimatorEvents(
+                    star_tracker_processed=(
+                        next_estimator.last_star_tracker_step
+                        > estimator.last_star_tracker_step
+                    ),
+                    magnetometer_processed=(
+                        next_estimator.last_magnetometer_step
+                        > estimator.last_magnetometer_step
+                    ),
+                    sun_sensor_processed=(
+                        next_estimator.last_sun_sensor_step
+                        > estimator.last_sun_sensor_step
+                    ),
+                    star_tracker_accepted=(
+                        next_estimator.star_tracker_update_accepted
+                        & (
+                            next_estimator.last_star_tracker_step
+                            > estimator.last_star_tracker_step
+                        )
+                    ),
+                    magnetometer_accepted=(
+                        next_estimator.magnetometer_update_accepted
+                        & (
+                            next_estimator.last_magnetometer_step
+                            > estimator.last_magnetometer_step
+                        )
+                    ),
+                    sun_sensor_accepted=(
+                        next_estimator.sun_sensor_update_accepted
+                        & (
+                            next_estimator.last_sun_sensor_step
+                            > estimator.last_sun_sensor_step
+                        )
+                    ),
+                )
+                return (
+                    next_physical, next_orbit, next_sensors, next_estimator
+                ), (actuation, events)
 
-        (next_physical, next_orbit, next_sensors), actuation_sequence = jax.lax.scan(
+        (
+            next_physical,
+            next_orbit,
+            next_sensors,
+            next_estimator,
+        ), (actuation_sequence, estimator_events) = jax.lax.scan(
             substep,
-            (state.physical, state.orbit, state.sensors),
+            (state.physical, state.orbit, state.sensors, state.estimator),
             substep_indices,
         )
+
 
         previous_error_q = attitude_error(state.target_q, state.physical.q)
         error_q = attitude_error(state.target_q, next_physical.q)
@@ -388,6 +529,7 @@ class SatelliteEnv:
             physical=next_physical,
             orbit=next_orbit,
             sensors=next_sensors,
+            estimator=next_estimator,
             target_q=state.target_q,
             wheel_mask=next_mask,
             previous_action=action,
@@ -439,5 +581,31 @@ class SatelliteEnv:
             magnetometer_age_seconds=sensor_ages.magnetometer,
             sun_sensor_age_seconds=sensor_ages.sun_sensor,
             gnss_age_seconds=sensor_ages.gnss,
+            estimated_q=next_estimator.q,
+            estimated_omega=next_estimator.omega,
+            estimated_gyro_bias=next_estimator.gyro_bias,
+            estimator_attitude_sigma_rad=attitude_sigma_rad(next_estimator),
+            estimator_bias_sigma_rad_s=gyro_bias_sigma_rad_s(next_estimator),
+            star_tracker_nis=next_estimator.star_tracker_nis,
+            magnetometer_nis=next_estimator.magnetometer_nis,
+            sun_sensor_nis=next_estimator.sun_sensor_nis,
+            star_tracker_update_processed=jnp.any(
+                estimator_events.star_tracker_processed, axis=0
+            ),
+            magnetometer_update_processed=jnp.any(
+                estimator_events.magnetometer_processed, axis=0
+            ),
+            sun_sensor_update_processed=jnp.any(
+                estimator_events.sun_sensor_processed, axis=0
+            ),
+            star_tracker_update_accepted=jnp.any(
+                estimator_events.star_tracker_accepted, axis=0
+            ),
+            magnetometer_update_accepted=jnp.any(
+                estimator_events.magnetometer_accepted, axis=0
+            ),
+            sun_sensor_update_accepted=jnp.any(
+                estimator_events.sun_sensor_accepted, axis=0
+            ),
         )
         return next_state, reward_terms.reward, done.astype(jnp.float32), info

@@ -54,8 +54,8 @@ def axis_angle_to_quat(axis: jax.Array, angle: jax.Array) -> jax.Array:
     )
 
 
-def integrate_quaternion(q: jax.Array, omega_body: jax.Array, dt: float) -> jax.Array:
-    rotation_vector = omega_body * dt
+def rotation_vector_to_quat(rotation_vector: jax.Array) -> jax.Array:
+    """Converts body-frame rotation vectors [rad] to unit quaternions."""
     angle = jnp.linalg.norm(rotation_vector, axis=-1, keepdims=True)
     half_angle = 0.5 * angle
     scale = jnp.where(
@@ -63,9 +63,16 @@ def integrate_quaternion(q: jax.Array, omega_body: jax.Array, dt: float) -> jax.
         jnp.sin(half_angle) / angle,
         0.5 - jnp.square(angle) / 48.0,
     )
-    delta_q = jnp.concatenate(
-        [jnp.cos(half_angle), rotation_vector * scale], axis=-1
+    return quat_normalize(
+        jnp.concatenate(
+            [jnp.cos(half_angle), rotation_vector * scale], axis=-1
+        )
     )
+
+
+def integrate_quaternion(q: jax.Array, omega_body: jax.Array, dt: float) -> jax.Array:
+    """Exponential-map integration for constant body rate over ``dt``."""
+    delta_q = rotation_vector_to_quat(omega_body * dt)
     return quat_normalize(quat_multiply(q, delta_q))
 
 

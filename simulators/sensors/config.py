@@ -31,6 +31,17 @@ class PhysicsConfig:
     control_dt: float = 0.05
     allocation_regularization: float = 1.0e-7
 
+    @property
+    def substeps(self) -> int:
+        ratio = self.control_dt / self.physics_dt
+        rounded = int(round(ratio))
+        if abs(ratio - rounded) > 1.0e-9:
+            raise ValueError("control_dt must be an integer multiple of physics_dt")
+        if rounded < 1:
+            raise ValueError("control_dt must be >= physics_dt")
+        return rounded
+
+
 @dataclass(frozen=True)
 class TaskConfig:
     reset_mode: ResetMode = "cone"
@@ -120,6 +131,43 @@ class SensorConfig:
     gnss_rate_hz: float = 1.0
     gnss_latency_seconds: float = 0.0
 
+    sun_sensor_eclipse_enabled: bool = False
+
+
+@dataclass(frozen=True)
+class EstimatorConfig:
+    """Six-state quaternion error-state EKF configuration.
+
+    The filter estimates body-to-inertial attitude and additive gyro bias.
+    Measurement standard deviations are tuning values for the clean A.3 sensor
+    model; Milestone B will make them consistent with injected sensor errors.
+    """
+
+    enabled: bool = True
+    initialize_from_star_tracker: bool = True
+    compensate_fixed_latency: bool = True
+
+    use_star_tracker: bool = True
+    use_magnetometer: bool = True
+    use_sun_sensor: bool = True
+
+    initial_attitude_sigma_deg: float = 10.0
+    initial_gyro_bias_sigma_rad_s: float = 0.02
+
+    gyro_process_noise_rad_s_sqrt_hz: float = 2.0e-4
+    gyro_bias_random_walk_rad_s2_sqrt_hz: float = 1.0e-6
+
+    star_tracker_noise_std_deg: float = 0.02
+    magnetometer_noise_std_deg: float = 0.50
+    sun_sensor_noise_std_deg: float = 0.50
+
+    star_tracker_nis_gate: float = 25.0
+    magnetometer_nis_gate: float = 25.0
+    sun_sensor_nis_gate: float = 25.0
+
+    covariance_floor: float = 1.0e-12
+    innovation_regularization: float = 1.0e-10
+
 
 @dataclass(frozen=True)
 class ObservationConfig:
@@ -185,6 +233,7 @@ class ExperimentConfig:
     faults: WheelFaultConfig = field(default_factory=WheelFaultConfig)
     orbit: OrbitConfig = field(default_factory=OrbitConfig)
     sensors: SensorConfig = field(default_factory=SensorConfig)
+    estimator: EstimatorConfig = field(default_factory=EstimatorConfig)
     observation: ObservationConfig = field(default_factory=ObservationConfig)
     reward: RewardConfig = field(default_factory=RewardConfig)
     network: NetworkConfig = field(default_factory=NetworkConfig)
@@ -195,10 +244,130 @@ class ExperimentConfig:
 def default_config() -> ExperimentConfig:
     return ExperimentConfig()
 
+def config_from_dict(data: dict) -> ExperimentConfig:
+    """Reconstructs a config saved in a checkpoint.
+
+    Older A.1/A.2 checkpoints did not contain an ``estimator`` section. They
+    are loaded with the estimator disabled so evaluation preserves the original
+    observation semantics. New A.3 checkpoints store the estimator config
+    explicitly and therefore restore it exactly.
+    """
+    estimator_data = data.get("estimator")
+    estimator = (
+        EstimatorConfig(**estimator_data)
+        if estimator_data is not None
+        else EstimatorConfig(enabled=False)
+    )
+    return ExperimentConfig(
+        physics=PhysicsConfig(**data["physics"]),
+        task=TaskConfig(**data["task"]),
+        control=ControlConfig(**data["control"]),
+        faults=WheelFaultConfig(**data.get("faults", {})),
+        orbit=OrbitConfig(**data.get("orbit", {})),
+        sensors=SensorConfig(**data.get("sensors", {})),
+        estimator=estimator,
+        observation=ObservationConfig(**data["observation"]),
+        reward=RewardConfig(**data["reward"]),
+        network=NetworkConfig(**data["network"]),
+        ppo=PPOConfig(**data["ppo"]),
+        run=RunConfig(**data["run"]),
+    )
+
 
 def validate_config(config: ExperimentConfig) -> None:
     """Raises ValueError for inconsistent or non-physical settings."""
-    f = config.faults,
+    p, t, o, r, c, f, orbit, s, ppo, e = (
+        config.physics,
+        config.task,
+        config.observation,
+        config.reward,
+        config.control,
+        config.faults,
+        config.orbit,
+        config.sensors,
+        config.ppo,
+        config.estimator,
+    )
+    if any(value <= 0.0 for value in p.body_inertia):
+        raise ValueError("body_inertia entries must be positive")
+    if p.wheel_inertia <= 0.0:
+        raise ValueError("wheel_inertia must be positive")
+    if p.max_wheel_speed <= 0.0 or p.max_motor_torque <= 0.0:
+        raise ValueError("wheel and motor limits must be positive")
+    if p.motor_control_limit <= 0.0 or p.motor_control_limit > p.max_motor_torque:
+        raise ValueError("motor_control_limit must be in (0, max_motor_torque]")
+    if any(value <= 0.0 for value in p.body_torque_limit):
+        raise ValueError("body_torque_limit entries must be positive")
+    _ = p.substeps
+    episode_ratio = t.episode_seconds / p.control_dt
+    if abs(episode_ratio - round(episode_ratio)) > 1.0e-9:
+        raise ValueError("episode_seconds must be an integer multiple of control_dt")
+    if t.success_dwell_seconds <= 0.0 or t.success_dwell_seconds > t.episode_seconds:
+        raise ValueError("success_dwell_seconds must be in (0, episode_seconds]")
+    if o.omega_scale <= 0.0 or r.rate_scale <= 0.0:
+        raise ValueError("observation and reward rate scales must be positive")
+    if c.mode not in ("residual_pd", "direct", "motor_direct"):
+        raise ValueError(f"unsupported control mode: {c.mode}")
+    if not 0.0 <= c.residual_scale <= 1.0:
+        raise ValueError("residual_scale must be in [0, 1]")
+    if ppo.num_envs < 1 or ppo.num_minibatches < 1 or ppo.update_epochs < 1:
+        raise ValueError("PPO counts must be positive")
+
+
+    if orbit.earth_mu_m3_s2 <= 0.0 or orbit.earth_radius_m <= 0.0:
+        raise ValueError("Earth gravitational parameter and radius must be positive")
+    if orbit.altitude_m <= 0.0:
+        raise ValueError("orbit altitude must be positive")
+    if orbit.magnetic_equator_field_t <= 0.0:
+        raise ValueError("magnetic_equator_field_t must be positive")
+    if sum(value * value for value in orbit.sun_direction_eci) <= 0.0:
+        raise ValueError("sun_direction_eci must be non-zero")
+
+
+    def validate_sensor_clock(name: str, rate_hz: float, latency_seconds: float) -> None:
+        if rate_hz <= 0.0:
+            raise ValueError(f"{name} rate must be positive")
+        period_ratio = 1.0 / (rate_hz * p.physics_dt)
+        period_steps = int(round(period_ratio))
+        if period_steps < 1 or abs(period_ratio - period_steps) > 1.0e-9:
+            raise ValueError(
+                f"{name} rate must divide the physics rate exactly; "
+                f"got rate_hz={rate_hz}, physics_dt={p.physics_dt}"
+            )
+        if latency_seconds < 0.0:
+            raise ValueError(f"{name} latency must be non-negative")
+        latency_ratio = latency_seconds / p.physics_dt
+        if abs(latency_ratio - round(latency_ratio)) > 1.0e-9:
+            raise ValueError(
+                f"{name} latency must be an integer multiple of physics_dt"
+            )
+
+    validate_sensor_clock(
+        "gyro", s.gyro_rate_hz, s.gyro_latency_seconds
+    )
+    validate_sensor_clock(
+        "wheel tachometer",
+        s.wheel_tach_rate_hz,
+        s.wheel_tach_latency_seconds,
+    )
+    validate_sensor_clock(
+        "star tracker",
+        s.star_tracker_rate_hz,
+        s.star_tracker_latency_seconds,
+    )
+    validate_sensor_clock(
+        "magnetometer",
+        s.magnetometer_rate_hz,
+        s.magnetometer_latency_seconds,
+    )
+    validate_sensor_clock(
+        "Sun sensor",
+        s.sun_sensor_rate_hz,
+        s.sun_sensor_latency_seconds,
+    )
+    validate_sensor_clock(
+        "GNSS", s.gnss_rate_hz, s.gnss_latency_seconds
+    )
 
     if f.mode not in (
         "none",
@@ -224,3 +393,25 @@ def validate_config(config: ExperimentConfig) -> None:
         raise ValueError("random fault duration range is invalid")
     if f.failure_rate_per_second < 0.0 or f.recovery_rate_per_second < 0.0:
         raise ValueError("stochastic fault rates must be non-negative")
+
+    nonnegative_estimator_values = (
+        e.initial_gyro_bias_sigma_rad_s,
+        e.gyro_process_noise_rad_s_sqrt_hz,
+        e.gyro_bias_random_walk_rad_s2_sqrt_hz,
+    )
+    if any(value < 0.0 for value in nonnegative_estimator_values):
+        raise ValueError("estimator process noise and bias sigma must be non-negative")
+
+    positive_estimator_values = (
+        e.initial_attitude_sigma_deg,
+        e.star_tracker_noise_std_deg,
+        e.magnetometer_noise_std_deg,
+        e.sun_sensor_noise_std_deg,
+        e.star_tracker_nis_gate,
+        e.magnetometer_nis_gate,
+        e.sun_sensor_nis_gate,
+        e.covariance_floor,
+        e.innovation_regularization,
+    )
+    if any(value <= 0.0 for value in positive_estimator_values):
+        raise ValueError("estimator covariance, measurement noise, and gates must be positive")
