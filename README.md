@@ -1,3 +1,81 @@
+# Milestone A.1 — gyro and wheel-tachometer integration
+
+This version adapts the sensor layer to the project's existing JAX,
+batched, multi-rate environment. All sensor state is part of `EnvState` 
+and is advanced inside the same `jax.lax.scan` that advances the physics.
+
+## Current observation
+
+Previously the project does not expose a raw quaternion. Its base observation is:
+
+```
+attitude error vector (3) + body rate (3) + wheel speeds (4)
+```
+
+and optionally previous action and the four-wheel motor mask.
+
+After this change:
+
+```
+attitude error vector: still truth-derived temporarily
+body rate:             delivered gyro measurement
+wheel speeds:          delivered tachometer measurements
+```
+
+The observation shape is unchanged, so existing checkpoints remain compatible
+with the default perfect sensor settings.
+
+## Rate hierarchy
+
+Default configuration:
+
+```
+physics:          100 Hz (`physics_dt = 0.01`)
+control/policy:    20 Hz (`control_dt = 0.05`)
+gyro:             100 Hz
+wheel tachometers:100 Hz
+```
+
+One environment step still holds the selected action for five physics substeps.
+Each physics substep now also advances the sensor histories, sample clocks and
+fixed-latency delivery logic.
+
+Asynchronous clean sensor clocks and fixed transport latency. Rates must be 
+integer divisors of the physics update rate. Latencies must be integer multiples 
+of ``physics_dt`` so array shapes and schedules remain static during JAX compilation.
+
+## Controller/plant separation
+
+The body-torque allocator was split into two stages:
+
+1. `allocate_body_torque_command(...)` computes motor commands from desired body
+   torque and **tachometer measurements**.
+2. `motor_torque_to_net_rotor_torque(...)` applies those commands to the **true**
+   rotor state, including true bearing friction, torque limits and speed limits.
+
+Thus stale or damaged tachometer telemetry can later create a genuine
+controller/plant mismatch without corrupting the physical truth model.
+
+The residual/classical PD damping term now uses `state.sensors.gyro` instead of
+`state.physical.omega`. Attitude remains truth-derived until the MEKF milestone.
+
+
+## Orbit
+
+Simple LEO reference environment for attitude sensors.
+
+The ADCS plant remains rotational only. It adds a decoupled circular
+orbit used to generate navigation truth and inertial reference vectors for the
+magnetometer, Sun sensor, and GNSS receiver. These is clean deterministic 
+reference models, not yet high-fidelity orbit or space-weather models.
+
+Earth-to-Sun unit direction in ECI, treated as constant over one episode.
+
+
+
+
+
+
 # Milestone A.0 — initial implementation
 
 This project aims to train a reinforcement learning agent to control satellite’s Attitude Determination and Control System (ADCS). The system uses three orthogonal reaction wheels to provide full three-axis control, while a fourth wheel is added as a backup, creating a redundant configuration.
