@@ -369,6 +369,27 @@ def _star_tracker_update(
         config.star_tracker_nis_gate,
         config,
     )
+    first_star_solution = (
+        new_packet
+        & sensors.star_tracker_valid
+        & config.use_star_tracker
+        & config.hard_acquire_first_star_tracker
+        & (state.last_star_tracker_step < 0)
+    )
+    next_state = next_state._replace(
+        q=jnp.where(
+            first_star_solution[:, None],
+            measurement_q,
+            next_state.q,
+        ),
+        
+        covariance=jnp.where(
+            first_star_solution[:, None, None],
+            state.covariance,
+            next_state.covariance,
+        ),
+    )
+    accepted = accepted | first_star_solution
     return next_state._replace(
         last_star_tracker_step=jnp.where(
             new_packet,

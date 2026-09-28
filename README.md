@@ -1,3 +1,44 @@
+# Milestone A.2 — clean asynchronous attitude/navigation sensors
+
+Extends projects with sensors readings as observation, updates orbit logic. 
+The new star tracker, magnetometer, Sun sensor, and GNSS are not yet fed 
+directly to the policy. Because `physics_dt=0.01`, every latency above is an 
+integer multiple of 10 ms.
+
+## Added reference environment
+
+`orbit.py` adds a decoupled circular LEO truth state:
+
+- 500 km default altitude;
+- 51.6° default inclination;
+- exact circular-orbit rotation at every physics substep;
+- centered tilted magnetic dipole;
+- fixed inertial Sun direction over one short episode;
+- geometric Earth-eclipse truth.
+
+The orbit is used only to generate sensor/reference truth. It does not apply
+translational forces to the rotational plant.
+
+## Added sensors
+
+All sensors remain pure JAX state carried inside `EnvState` and are updated inside
+the existing physics `lax.scan`.
+
+| Sensor | Default rate | Measurement |
+|---|---:|---|
+| Gyroscope | 100 Hz | body angular rate, rad/s |
+| Wheel tachometers | 100 Hz | four rotor speeds, rad/s |
+| Star tracker | 2 Hz | body-to-inertial quaternion `[w,x,y,z]` |
+| Magnetometer | 10 Hz | magnetic field in body coordinates, tesla |
+| Sun sensor | 10 Hz | unit Sun direction in body coordinates |
+| GNSS | 1 Hz | ECI position, ECI velocity, simulation/navigation time |
+
+Every sensor supports independent fixed latency, sample-and-hold, validity, and
+sample age. Rates must divide the physics rate exactly and latencies must be
+integer multiples of `physics_dt`.
+
+
+
 # Milestone A.1 — gyro and wheel-tachometer integration
 
 This version adapts the sensor layer to the project's existing JAX,

@@ -145,6 +145,7 @@ class EstimatorConfig:
 
     enabled: bool = True
     initialize_from_star_tracker: bool = True
+    hard_acquire_first_star_tracker: bool = True
     compensate_fixed_latency: bool = True
 
     use_star_tracker: bool = True

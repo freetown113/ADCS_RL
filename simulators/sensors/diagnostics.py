@@ -1,18 +1,15 @@
-"""Must-pass diagnostics for physics, allocation, reward, and control wiring."""
-from __future__ import annotations
-
 import argparse
 from dataclasses import replace
 
 import jax
 import jax.numpy as jnp
 
-from .config import SensorConfig, WheelFaultConfig, default_config
-from .env import SatelliteEnv
-from .control import normalized_pd_body_action
-from .evaluation import compare_baselines, evaluate_policy
-from .network import make_network
-from .ppo import (
+from simulators.sensors.config import SensorConfig, WheelFaultConfig, default_config
+from simulators.sensors.env import SatelliteEnv
+from simulators.sensors.control import normalized_pd_body_action
+from simulators.sensors.evaluation import compare_baselines, evaluate_policy
+from simulators.sensors.network import make_network
+from simulators.sensors.ppo import (
     TrainState, collect_rollout, compute_gae, flatten_rollout,
     make_optimizer, make_ppo_update,
 )

@@ -3,25 +3,23 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 
-from .config import OrbitConfig
-
-Array = jax.Array
+from simulators.sensors.config import OrbitConfig
 
 
 class OrbitState(NamedTuple):
-    position_eci_m: Array
-    velocity_eci_m_s: Array
-    time_s: Array
-    magnetic_field_eci_t: Array
-    sun_direction_eci: Array
-    sun_visible: Array
+    position_eci_m: jax.Array
+    velocity_eci_m_s: jax.Array
+    time_s: jax.Array
+    magnetic_field_eci_t: jax.Array
+    sun_direction_eci: jax.Array
+    sun_visible: jax.Array
 
 
-def _normalize(vector: Array, eps: float = 1.0e-12) -> Array:
+def _normalize(vector: jax.Array, eps: float = 1.0e-12) -> jax.Array:
     return vector / (jnp.linalg.norm(vector, axis=-1, keepdims=True) + eps)
 
 
-def _orbit_basis(config: OrbitConfig, dtype=jnp.float32) -> tuple[Array, Array]:
+def _orbit_basis(config: OrbitConfig, dtype=jnp.float32) -> tuple[jax.Array, jax.Array]:
     """Returns orthonormal in-plane basis vectors p_hat and q_hat in ECI."""
     inclination = jnp.deg2rad(jnp.asarray(config.inclination_deg, dtype=dtype))
     raan = jnp.deg2rad(jnp.asarray(config.raan_deg, dtype=dtype))
@@ -40,7 +38,7 @@ def _orbit_basis(config: OrbitConfig, dtype=jnp.float32) -> tuple[Array, Array]:
     return p_hat, q_hat
 
 
-def magnetic_dipole_axis_eci(config: OrbitConfig, dtype=jnp.float32) -> Array:
+def magnetic_dipole_axis_eci(config: OrbitConfig, dtype=jnp.float32) -> jax.Array:
     """Fixed unit magnetic dipole axis used by the centered-dipole model."""
     tilt = jnp.deg2rad(jnp.asarray(config.magnetic_dipole_tilt_deg, dtype=dtype))
     longitude = jnp.deg2rad(
@@ -57,7 +55,7 @@ def magnetic_dipole_axis_eci(config: OrbitConfig, dtype=jnp.float32) -> Array:
     return _normalize(axis)
 
 
-def magnetic_field_eci(position_eci_m: Array, config: OrbitConfig) -> Array:
+def magnetic_field_eci(position_eci_m: jax.Array, config: OrbitConfig) -> jax.Array:
     """Centered-dipole magnetic field in ECI, in tesla.
 
     ``magnetic_equator_field_t`` is the surface equatorial magnitude.  This is a
@@ -76,16 +74,16 @@ def magnetic_field_eci(position_eci_m: Array, config: OrbitConfig) -> Array:
     return scale * (3.0 * projection * r_hat - dipole)
 
 
-def sun_direction_eci(config: OrbitConfig, dtype=jnp.float32) -> Array:
+def sun_direction_eci(config: OrbitConfig, dtype=jnp.float32) -> jax.Array:
     vector = jnp.asarray(config.sun_direction_eci, dtype=dtype)
     return _normalize(vector)
 
 
 def earth_eclipse_mask(
-    position_eci_m: Array,
-    sun_eci: Array,
+    position_eci_m: jax.Array,
+    sun_eci: jax.Array,
     config: OrbitConfig,
-) -> Array:
+) -> jax.Array:
     """True where Earth geometrically blocks the Sun from the spacecraft."""
     sun = _normalize(sun_eci)
     along_sun = jnp.sum(position_eci_m * sun, axis=-1)
@@ -125,7 +123,7 @@ def reset_orbit_state(batch_size: int, config: OrbitConfig) -> OrbitState:
     )
 
 
-def _rotate_about_axis(vector: Array, axis: Array, angle: Array) -> Array:
+def _rotate_about_axis(vector: jax.Array, axis: jax.Array, angle: jax.Array) -> jax.Array:
     """Batch-safe Rodrigues rotation."""
     axis = _normalize(axis)
     cosine = jnp.cos(angle)[..., None]

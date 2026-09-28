@@ -210,7 +210,7 @@ def summarize_trajectory(env: SatelliteEnv, trajectory: EvaluationTrajectory) ->
     estimator_rate_error = jnp.linalg.norm(
         trajectory.omega - trajectory.estimated_omega, axis=-1
     )
-    
+
     return {
         "episode_return_mean": jnp.mean(episode_return),
         "episode_return_median": jnp.median(episode_return),
