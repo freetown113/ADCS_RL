@@ -1,3 +1,116 @@
+# Milestone A.3 — Six-state MEKF integration
+
+Previous version is extended with a multiplicative attitude EKF(MEKF). 
+The estimator is part of `EnvState`, advances inside every physics
+substep, and is compatible with batching, `jax.jit`, `jax.lax.scan`, PPO, and
+imitation-learning rollouts.
+
+Previously the star tracker, magnetometer, Sun sensor, and GNSS were generated and
+logged, but they did part of observation or the residual PD controller.
+Only the gyro and wheel tachometers affected control. Therefore, with identical
+gyro/tachometer settings and identical seeds/actions, changing only attitude
+sensor rates, latency, or eclipse must produce identical physical trajectories,
+observations, and rewards.Now all sensor settings do affect control because the MEKF consumes them.
+
+## Filter definition
+
+Nominal state:
+- body-to-inertial quaternion `q_hat`, order `[w, x, y, z]`;
+- additive gyro bias estimate `b_hat`.
+
+Six-dimensional local error state:
+```
+error_state = [delta_theta_x, delta_theta_y, delta_theta_z,
+               delta_bias_x,  delta_bias_y,  delta_bias_z]
+```
+The implementation uses a right-multiplicative attitude error:
+```
+q_true = q_hat ⊗ delta_q(delta_theta)
+```
+The estimator propagates at `physics_dt` using the latest delivered gyro sample:
+```
+omega_hat = gyro_measurement - b_hat
+q_hat(k+1) = q_hat(k) ⊗ exp_quaternion(omega_hat * physics_dt)
+```
+The covariance is propagated with a first-order discrete state transition and 
+multiplicative covariance reset are included for numerical stability.
+
+The filter consumes every newly delivered packet exactly once.
+
+### Star tracker
+
+The star tracker supplies a body-to-inertial quaternion. The residual is the
+small local rotation between the estimated and measured quaternions. A 3-D
+attitude update is applied.
+
+### Magnetometer
+
+The magnetometer supplies the measured body-frame magnetic vector. GNSS position
+is passed through the centered-dipole model to construct the inertial reference
+vector. Both vectors are normalized before the update, so the update primarily
+uses direction rather than field magnitude.
+
+### Sun sensor
+
+The Sun sensor supplies a body-frame Sun direction. It is fused against the
+configured inertial Sun direction. When eclipse handling is enabled, an invalid
+Sun packet is consumed but does not update the filter.
+
+### GNSS
+
+GNSS is not itself an attitude update. Its position is used to calculate the
+magnetic inertial reference. GNSS time and velocity remain available for later
+navigation and reference-frame work.
+
+## Fixed-latency compensation
+
+When `compensate_fixed_latency=True`, delayed measurements are extrapolated from
+their sample timestamp to delivery time using the current bias-corrected gyro rate:
+- star-tracker quaternion: propagated forward;
+- body-frame magnetic/Sun vectors: rotated into the estimated current body frame.
+This is a first-order approximation.
+
+## Observation and controller paths
+
+With the estimator enabled, the actor receives:
+```
+3  target-relative estimated attitude vector
+3  estimated body rate
+4  measured wheel speeds
+N  previous action
+4  wheel motor availability mask
+```
+
+The observation size is unchanged. Existing network architecture remains valid,
+but a policy should be retrained because the meaning of the attitude/rate fields
+has changed from privileged/partially privileged values to estimated values.
+
+The residual PD controller now also uses `q_hat` and `omega_hat`. Therefore the
+policy and classical controller share the same estimated state.
+
+Truth remains available only for:
+
+- rotational/orbit physics;
+- sensor generation;
+- reward and success calculation;
+- estimator-error diagnostics and plots.
+
+## Delayed star-tracker acquisition
+
+Star traker initialization caused an erroneous behavior:
+With zero star-tracker latency, the star packet was valid at environment reset and the MEKF initialized directly from it, but with any positive star-tracker latency, reset started from the identity quaternion. Tthe first delayed star quaternion was then treated as an ordinary MEKF update and subjected to the NIS gate, so with initial attitude errors higher than 53 degree the valid star solution was rejected.
+
+It was fixed with adding `EstimatorConfig.hard_acquire_first_star_tracker=True`, that makes that when the first valid star quaternion arrives and no star solution has previously been processed, the estimator:
+- applies the existing fixed-latency quaternion compensation;
+- uses that quaternion as a **global attitude acquisition/reset**;
+- keeps covariance conservative;
+- marks the first star solution accepted;
+- returns to ordinary NIS-gated local MEKF corrections for all later star packets.
+This does not bypass NIS gating for subsequent star-tracker outliers.
+
+However current solution still extrapolates a delayed star quaternion to the present using one current bias-corrected gyro rate over the whole latency interval. That is only first-order compensation. Under rapid motor-direct challenging maneuvers, 80 ms can span appreciable angular acceleration, so a residual estimate jump/oscillation can remain.
+
+
 # Milestone A.2 — clean asynchronous attitude/navigation sensors
 
 Extends projects with sensors readings as observation, updates orbit logic. 
