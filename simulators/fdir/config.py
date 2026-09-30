@@ -12,7 +12,14 @@ FaultMode = Literal[
     "stochastic",
 ]
 WheelSelection = Literal["fixed", "random"]
-GuidanceMode = Literal["inertial_hold", "nadir_lvlh"]
+GuidanceMode = Literal[
+    "inertial_hold",
+    "nadir_lvlh",
+    "ground_target",
+    "ground_station",
+    "sun_pointing",
+    "scheduled_slew",
+]
 
 
 @dataclass(frozen=True)
@@ -228,14 +235,90 @@ class GuidanceConfig:
     """
     mode: GuidanceMode = "inertial_hold"
 
+    # Arbitrary inertial attitude. The legacy identity hold is recovered by the
+    # default quaternion. Quaternion convention is [w, x, y, z], body -> ECI.
+    inertial_target_q: Tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
+
+    # Earth-fixed target/station coordinates. These are mission data, not sensor
+    # truth: in flight they would normally come from a target/station catalogue or
+    # an uploaded mission timeline.
+    earth_target_lat_deg: float = 0.0
+    earth_target_lon_deg: float = 0.0
+    earth_target_alt_m: float = 0.0
+    earth_tracking_body_axis: Literal["+X", "-X", "+Y", "-Y", "+Z", "-Z"] = "+Z"
+    earth_target_fallback_mode: Literal["nadir_lvlh", "inertial_hold"] = "nadir_lvlh"
+    antenna_half_beamwidth_deg: float = 10.0
+
+    # Sun-pointing/safe-attitude reference. The configured body axis is aligned
+    # with the inertial Sun direction; roll is fixed deterministically.
+    sun_pointing_body_axis: Literal["+X", "-X", "+Y", "-Y", "+Z", "-Z"] = "+Z"
+
+    # Rest-to-rest scheduled slew between two inertial attitudes. The trajectory
+    # is generated with a triangular/trapezoidal angular-rate profile constrained
+    # by the requested maximum rate and acceleration.
+    slew_start_q: Tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
+    slew_end_q: Tuple[float, float, float, float] = (0.9238795, 0.0, 0.3826834, 0.0)
+    slew_start_seconds: float = 1.0
+    slew_max_rate_deg_s: float = 2.0
+    slew_max_accel_deg_s2: float = 0.5
+
+
+@dataclass(frozen=True)
+class FDIRConfig:
+    """Telemetry-derived health estimation thresholds.
+    No member of this config references injected fault identity. FDIR receives
+    commands, telemetry and estimator diagnostics only.
+    """
+
+    enabled: bool = True
+    wheel_authority_ewma_alpha: float = 0.08
+    wheel_min_excitation_torque: float = 0.003
+    wheel_degraded_authority: float = 0.80
+    wheel_failed_authority: float = 0.15
+    wheel_recovery_authority: float = 0.90
+    wheel_suspect_samples: int = 5
+    wheel_fail_samples: int = 20
+    wheel_recovery_samples: int = 50
+    wheel_speed_monitor_fraction: float = 0.95
+
+    # Watchdog multipliers are relative to nominal sensor sample period.
+    fast_sensor_stale_periods: float = 4.0
+    slow_sensor_stale_periods: float = 4.0
+    nis_ewma_alpha: float = 0.15
+    nis_suspect_ratio: float = 0.80
+    innovation_suspect_samples: int = 3
+    innovation_fail_samples: int = 8
+    sensor_recovery_samples: int = 10
+
+    estimator_fine_sigma_deg: float = 1.0
+    estimator_degraded_sigma_deg: float = 5.0
+    estimator_lost_sigma_deg: float = 20.0
+
+
+@dataclass(frozen=True)
+class SupervisorConfig:
+    """Supervisory-GNC mode transition thresholds and hysteresis."""
+
+    enabled: bool = True
+    enter_degraded_dwell_seconds: float = 0.25
+    enter_safe_dwell_seconds: float = 0.50
+    recovery_dwell_seconds: float = 3.0
+    acquisition_dwell_seconds: float = 0.50
+    minimum_control_wheels: int = 3
+    degraded_wheel_authority: float = 0.80
+    failed_wheel_authority: float = 0.15
+    wheel_speed_degraded_fraction: float = 0.90
+    wheel_speed_critical_fraction: float = 0.98
+
 
 @dataclass(frozen=True)
 class ObservationConfig:
     omega_scale: float = 0.20
     include_previous_action: bool = True
     include_wheel_mask: bool = True
-    wheel_mask_source: Literal["truth", "unknown"] = "truth"
-
+    wheel_mask_source: Literal["fdir", "unknown"] = "fdir"
+    include_estimator_confidence: bool = False
+    include_supervisory_mode: bool = False
 
 @dataclass(frozen=True)
 class RewardConfig:
@@ -296,6 +379,8 @@ class ExperimentConfig:
     sensors: SensorConfig = field(default_factory=SensorConfig)
     estimator: EstimatorConfig = field(default_factory=EstimatorConfig)
     guidance: GuidanceConfig = field(default_factory=GuidanceConfig)
+    fdir: FDIRConfig = field(default_factory=FDIRConfig)
+    supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
     observation: ObservationConfig = field(default_factory=ObservationConfig)
     reward: RewardConfig = field(default_factory=RewardConfig)
     network: NetworkConfig = field(default_factory=NetworkConfig)
@@ -309,6 +394,7 @@ def default_config() -> ExperimentConfig:
 
 def config_from_dict(data: dict) -> ExperimentConfig:
     estimator_data = data.get("estimator")
+    legacy_without_estimator = estimator_data is None
     if estimator_data is not None:
         estimator_data = dict(estimator_data)
         estimator_data.pop("compensate_fixed_latency", None)
@@ -324,7 +410,15 @@ def config_from_dict(data: dict) -> ExperimentConfig:
         sensors=SensorConfig(**data.get("sensors", {})),
         estimator=estimator,
         guidance=GuidanceConfig(**data.get("guidance", {})),
-        observation=ObservationConfig(**data["observation"]),
+        fdir=FDIRConfig(**data.get("fdir", ({"enabled": False} if legacy_without_estimator else {}))),
+        supervisor=SupervisorConfig(**data.get("supervisor", ({"enabled": False} if legacy_without_estimator else {}))),
+        observation=ObservationConfig(**({
+            **data["observation"],
+            "wheel_mask_source": (
+                "fdir" if data["observation"].get("wheel_mask_source") == "truth"
+                else data["observation"].get("wheel_mask_source", "fdir")
+            ),
+        })),
         reward=RewardConfig(**data["reward"]),
         network=NetworkConfig(**data["network"]),
         ppo=PPOConfig(**data["ppo"]),
@@ -333,7 +427,7 @@ def config_from_dict(data: dict) -> ExperimentConfig:
 
 
 def validate_config(config: ExperimentConfig) -> None:
-    p, t, o, r, c, f, orbit, s, ppo, e, g = (
+    p, t, o, r, c, f, orbit, s, ppo, e, g, fd, sup = (
         config.physics,
         config.task,
         config.observation,
@@ -345,6 +439,8 @@ def validate_config(config: ExperimentConfig) -> None:
         config.ppo,
         config.estimator,
         config.guidance,
+        config.fdir,
+        config.supervisor,
     )
     if any(value <= 0.0 for value in p.body_inertia):
         raise ValueError("body_inertia entries must be positive")
@@ -376,10 +472,39 @@ def validate_config(config: ExperimentConfig) -> None:
         raise ValueError(f"unsupported control mode: {c.mode}")
     if not 0.0 <= c.residual_scale <= 1.0:
         raise ValueError("residual_scale must be in [0, 1]")
-    if o.wheel_mask_source not in ("truth", "unknown"):
-        raise ValueError("wheel_mask_source must be 'truth' or 'unknown'")
-    if g.mode not in ("inertial_hold", "nadir_lvlh"):
+    if o.wheel_mask_source not in ("fdir", "unknown"):
+        raise ValueError("wheel_mask_source must be 'fdir' or 'unknown'")
+    if g.mode not in (
+        "inertial_hold", "nadir_lvlh", "ground_target", "ground_station",
+        "sun_pointing", "scheduled_slew",
+    ):
         raise ValueError(f"unsupported guidance mode: {g.mode}")
+    if g.earth_tracking_body_axis not in ("+X", "-X", "+Y", "-Y", "+Z", "-Z"):
+        raise ValueError("unsupported earth_tracking_body_axis")
+    if g.sun_pointing_body_axis not in ("+X", "-X", "+Y", "-Y", "+Z", "-Z"):
+        raise ValueError("unsupported sun_pointing_body_axis")
+    if g.antenna_half_beamwidth_deg <= 0.0 or g.antenna_half_beamwidth_deg >= 90.0:
+        raise ValueError("antenna_half_beamwidth_deg must be in (0, 90)")
+    if g.slew_start_seconds < 0.0 or g.slew_max_rate_deg_s <= 0.0 or g.slew_max_accel_deg_s2 <= 0.0:
+        raise ValueError("scheduled slew start/rate/acceleration are invalid")
+    for name, quat in (("inertial_target_q", g.inertial_target_q), ("slew_start_q", g.slew_start_q), ("slew_end_q", g.slew_end_q)):
+        norm2 = sum(value * value for value in quat)
+        if norm2 <= 1.0e-12:
+            raise ValueError(f"{name} must be non-zero")
+    if orbit.earth_rotation_rate_rad_s < 0.0:
+        raise ValueError("earth_rotation_rate_rad_s must be non-negative")
+    if not 0.0 < fd.wheel_authority_ewma_alpha <= 1.0 or not 0.0 < fd.nis_ewma_alpha <= 1.0:
+        raise ValueError("FDIR EWMA alphas must be in (0, 1]")
+    if not 0.0 <= fd.wheel_failed_authority < fd.wheel_degraded_authority <= fd.wheel_recovery_authority <= 1.0:
+        raise ValueError("FDIR wheel authority thresholds are inconsistent")
+    if min(fd.wheel_suspect_samples, fd.wheel_fail_samples, fd.wheel_recovery_samples, fd.innovation_suspect_samples, fd.innovation_fail_samples, fd.sensor_recovery_samples) < 1:
+        raise ValueError("FDIR persistence counters must be positive")
+    if sup.minimum_control_wheels < 1 or sup.minimum_control_wheels > 4:
+        raise ValueError("minimum_control_wheels must be in [1,4]")
+    if not 0.0 < sup.wheel_speed_degraded_fraction < sup.wheel_speed_critical_fraction <= 1.0:
+        raise ValueError("supervisor wheel-speed fractions are inconsistent")
+    if min(sup.enter_degraded_dwell_seconds, sup.enter_safe_dwell_seconds, sup.recovery_dwell_seconds, sup.acquisition_dwell_seconds) < 0.0:
+        raise ValueError("supervisor dwell times must be non-negative")
     if ppo.num_envs < 1 or ppo.num_minibatches < 1 or ppo.update_epochs < 1:
         raise ValueError("PPO counts must be positive")
 

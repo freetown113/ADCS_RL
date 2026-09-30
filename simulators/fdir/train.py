@@ -185,7 +185,23 @@ def parse_config() -> ExperimentConfig:
     parser.add_argument("--fixed-angle-deg", type=float, default=None)
     parser.add_argument("--learning-rate", type=float, default=None)
     parser.add_argument("--control-mode", choices=["residual_pd", "direct", "motor_direct"], default=None)
-    parser.add_argument("--guidance-mode", choices=["inertial_hold", "nadir_lvlh"], default=None)
+    parser.add_argument(
+        "--guidance-mode",
+        choices=[
+            "inertial_hold", "nadir_lvlh", "ground_target", "ground_station",
+            "sun_pointing", "scheduled_slew",
+        ],
+        default=None,
+    )
+    parser.add_argument("--target-lat-deg", type=float, default=None)
+    parser.add_argument("--target-lon-deg", type=float, default=None)
+    parser.add_argument("--target-alt-m", type=float, default=None)
+    parser.add_argument("--earth-tracking-body-axis", choices=["+X", "-X", "+Y", "-Y", "+Z", "-Z"], default=None)
+    parser.add_argument("--antenna-half-beamwidth-deg", type=float, default=None)
+    parser.add_argument("--sun-pointing-body-axis", choices=["+X", "-X", "+Y", "-Y", "+Z", "-Z"], default=None)
+    parser.add_argument("--slew-start-seconds", type=float, default=None)
+    parser.add_argument("--slew-max-rate-deg-s", type=float, default=None)
+    parser.add_argument("--slew-max-accel-deg-s2", type=float, default=None)
     parser.add_argument("--residual-scale", type=float, default=None)
     parser.add_argument("--video-every", type=int, default=None)
     parser.add_argument(
@@ -257,6 +273,22 @@ def parse_config() -> ExperimentConfig:
         config = replace(
             config, guidance=replace(config.guidance, mode=args.guidance_mode)
         )
+    guidance_overrides = {
+        "earth_target_lat_deg": args.target_lat_deg,
+        "earth_target_lon_deg": args.target_lon_deg,
+        "earth_target_alt_m": args.target_alt_m,
+        "earth_tracking_body_axis": args.earth_tracking_body_axis,
+        "antenna_half_beamwidth_deg": args.antenna_half_beamwidth_deg,
+        "sun_pointing_body_axis": args.sun_pointing_body_axis,
+        "slew_start_seconds": args.slew_start_seconds,
+        "slew_max_rate_deg_s": args.slew_max_rate_deg_s,
+        "slew_max_accel_deg_s2": args.slew_max_accel_deg_s2,
+    }
+    for name, value in guidance_overrides.items():
+        if value is not None:
+            config = replace(
+                config, guidance=replace(config.guidance, **{name: value})
+            )
     if args.residual_scale is not None:
         config = replace(
             config, control=replace(config.control, residual_scale=args.residual_scale)

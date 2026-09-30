@@ -50,7 +50,7 @@ def body_action_to_motor_action(
     commanded_motor_torque = allocate_body_torque_command(
         desired_body_torque,
         state.sensors.wheel_speed,
-        state.wheel_mask,
+        state.fdir.wheel_authority_estimate,
         p,
     )
     return jnp.clip(

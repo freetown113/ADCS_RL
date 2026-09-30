@@ -1,6 +1,3 @@
-"""MP4 rendering for deterministic policy evaluation."""
-from __future__ import annotations
-
 from pathlib import Path
 from typing import Any
 
@@ -9,8 +6,8 @@ import jax
 import matplotlib.pyplot as plt
 import numpy as np
 
-from .env import EnvState, SatelliteEnv
-from .evaluation import EvaluationTrajectory, evaluate_policy
+from simulators.fdir.env import EnvState, SatelliteEnv
+from simulators.fdir.evaluation import EvaluationTrajectory, evaluate_policy
 
 
 def quaternion_to_rotation_matrix(q: np.ndarray) -> np.ndarray:
