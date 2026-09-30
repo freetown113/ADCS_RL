@@ -1,3 +1,135 @@
+# Milestone B.2 — FDIR, supervisory GNC, and mission guidance
+
+This milestone starts the transition from a sensor-realistic simulator to a 
+software-realistic architecture that makes assumptions about health instead of 
+assume receiving injected fault truth.
+
+## Architectural invariant
+
+Three states must remain separate:
+
+1. **plant/fault truth** — what the simulator actually broke;
+2. **FDIR belief** — what flight software infers from commands, telemetry and estimator diagnostics;
+3. **supervisory command** — what mode/reconfiguration flight software chooses from that belief.
+
+Previously actor got true about wheels state, now `EnvState.wheel_mask` remains simulator truth because 
+the plant needs it to physically remove/degrade motor torque. It is no longer available to the actor or 
+flight allocator. The actor's historical 4-value wheel-mask field now contains `FDIRState.wheel_authority_estimate` when `wheel_mask_source="fdir"`.
+
+The body-torque allocator also receives estimated authority. Physical authority is passed separately to the plant only.
+
+There are persistent health states
+`HEALTHY -> SUSPECT -> DEGRADED/FAILED -> RECOVERING -> HEALTHY`
+instead of a flag: failed/health. 
+The intuition is that a noisy residual is evidence, not a diagnosis. Persistence counters and hysteresis turn repeated evidence into a state transition and make recovery deliberately slower than detection.
+
+### Wheel authority residual
+
+Flight software knows the motor command and nominal actuator model, and receives wheel tachometer samples. 
+It predicts nominal motor torque and compares it with the torque implied by measured wheel acceleration:
+
+`tau_observed ~= Jw * domega_w/dt + tau_friction_predicted`
+
+An authority sample is the projection of observed motor equivalent torque. It is updated only when:
+- a fresh tachometer sample exists
+- requested torque is large enough to excite the channel
+- wheel speed is not near saturation
+- the tachometer has not already been isolated as failed
+
+This produces a continuous authority belief of the same shape as motor command instead of a binary failed-wheel identity.
+A motor-response residual alone is not sufficient to distinguish a failed motor from a failed tachometer. Current implementation therefore keeps motor health and tachometer health as separate states and does not claim motor isolation when tach telemetry itself is failed. 
+
+### Sensor FDIR
+
+The first sensor-health layer combines:
+- packet watchdog/staleness evaluated by timestamp
+- credibility protection for gyro packets
+- MEKF NIS and accepted/rejected update history for star tracker, magnetometer and Sun sensor
+- NIS EWMA and persistent reject counters
+- estimator covariance-derived confidence
+
+A fresh invalid Sun packet in eclipse is not a failed Sun sensor. Likewise, a fresh invalid star packet caused by acquisition/rate/exclusion is a question of availability, not automatically hardware failure. NIS health is updated only for valid measurements.
+Measurements already isolated as `FAILED` are rejected before the next MEKF fusion. Fixed-lag replay/timestamp mathematics remains entirely inside the estimator.
+
+## Supervisory GNC
+
+supervisor abstraction  is intentionally separate from fdir. While FDIR consider it's beleive in 
+measurements, the supervisor given that believe decides what should the satellite do.
+
+Implemented modes:
+- `ATTITUDE_ACQUIRE`
+- `FINE_POINTING`
+- `DEGRADED_POINTING`
+- `SAFE_SUN`
+
+The enum also reserves `DETUMBLE` and `MOMENTUM_UNLOAD`, but this milestone does not enter them automatically because physically complete implementations require an external-torque actuator such as magnetorquers or thrusters.
+Transitions use estimator acquisition/covariance, estimated wheel authority, sensor/gyro health, minimum controllable wheel count and asymmetric dwell timers. Fast degradation and slow recovery prevents mode flapping.
+When the supervisor enters `SAFE_SUN`, it overrides the configured mission target with the Sun-pointing target. The MEKF and FDIR remain separate.
+
+## Authority-aware allocation
+
+The old allocator first solved as if every nonzero-authority wheel were fully capable and then divided its requested torque by authority. That works until command saturation.
+Now it solved with the effective allocation matrix
+
+`A_eff = A * diag(authority_estimate)`
+
+and performs a second residual-allocation pass after command clipping. This makes partial-authority cases (80%, 50%, etc.) physically meaningful to the allocator without ever access true authority.
+
+## Mission guidance modes
+### 1. Configurable inertial pointing
+
+The default quaternion remains identity, so legacy inertial-hold behavior is preserved.
+
+### 2. Nadir/LVLH pointing
+
+Body `+Z` points nadir and `+X` follows horizontal velocity. The target angular velocity is orbital-frame angular velocity, not zero.
+
+### 3. Ground-target tracking
+
+The target is fixed in Earth coordinates but Earth rotates beneath the inertial orbit. The line of sight therefore changes continuously. The target attitude and target angular rate are computed from relative position, velocity and acceleration.
+When the target is below the local horizon, `reference_valid=False` and guidance falls back to `nadir_lvlh` by default.
+
+### 4. Ground-station / antenna tracking
+
+The geometry is the same as Earth-fixed target tracking. The mission interpretation changes from finger pointing to communications antenna boresight. `StepInfo.target_in_beam` is true when the station is above the horizon and the selected body antenna axis is within `antenna_half_beamwidth_deg` of the station line of sight.
+A conical antenna beam intersects the curved Earth in a footprint that is not exactly a circle, especially off nadir. For ADCS control, testing LOS angular error against beam half-angle is the cleaner first approximation and directly represents “keep the station inside the antenna footprint.”
+
+### 5. Sun pointing
+
+This can represent a normal power-positive mission mode or a safe-attitude target. Eclipse does not make the guidance direction undefined: the Sun direction still exists geometrically, but the Sun sensor becomes unavailable. That separation is important for FDIR.
+
+### 6. Rate/acceleration-limited scheduled slew
+
+A step change in attitude command asks for infinite reference angular acceleration. A real mission planner instead generates a feasible trajectory:
+- accelerate at the configured maximum angular acceleration;
+- optionally cruise at maximum angular rate;
+- decelerate symmetrically;
+- settle at the final inertial attitude.
+
+The controller therefore tracks both a moving quaternion and its physically consistent nonzero reference rate during the maneuver.
+
+## Ground target/station coordinates source:
+
+For the current implementation, coordinates are mission inputs in `GuidanceConfig` (`latitude`, `longitude`, `altitude`). This is analogous to an onboard target/station catalogue or a ground-uploaded mission timeline.
+
+Typical flight sources are:
+- surveyed coordinates for known ground stations
+- a mission-planning/target database for Earth-observation targets
+- uploaded target lists generated by the ground segment
+- later, an onboard perception/tracking system or inter-satellite/ground 
+  data link for moving/unplanned targets
+
+A target that is fixed on Earth's surface does not need its own ground velocity. Its ECI position and velocity still change because the Earth rotates.
+
+## Observation interface
+
+- attitude error: 3
+- target-relative rate error: 3
+- wheel tachometer speed: 4
+- previous action: 3 or 4
+- FDIR estimated wheel authority: 4
+
+
 # Milestone B.1 Fault tolerance closer to reality
 
 ### 1. Timestamp-correct MEKF
