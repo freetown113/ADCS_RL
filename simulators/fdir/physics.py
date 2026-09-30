@@ -6,7 +6,6 @@ import jax.numpy as jnp
 from simulators.fdir.config import PhysicsConfig
 from simulators.fdir.math3d import integrate_quaternion
 
-
 WHEEL_AXES = (
     jnp.asarray(
         [
@@ -30,6 +29,7 @@ class PhysicalState(NamedTuple):
 class ActuationInfo(NamedTuple):
     desired_body_torque: jax.Array
     achieved_body_torque: jax.Array
+    commanded_motor_torque: jax.Array
     motor_torque: jax.Array
     net_rotor_torque: jax.Array
     allocation_error: jax.Array
@@ -62,7 +62,7 @@ def _command_conditioning(command: jax.Array, config: PhysicsConfig) -> jax.Arra
 
 def wheel_friction_torque(wheel_speed: jax.Array, motor_torque: jax.Array,
                           config: PhysicsConfig) -> jax.Array:
-    """Torque opposing rotor motion"""
+    """Torque opposing rotor motion, including viscous, Coulomb and stiction."""
     viscous = config.bearing_friction * wheel_speed
     speed_scale = max(config.stiction_speed_rad_s, 1.0e-6)
     dynamic_coulomb = config.coulomb_friction_torque * jnp.tanh(wheel_speed / speed_scale)
@@ -142,26 +142,44 @@ def allocate_body_torque_command(
     wheel_control_mask: jax.Array,
     config: PhysicsConfig,
 ) -> jax.Array:
-    """Controller-side allocator using telemetry and assumed wheel authority."""
+    """Authority-aware bounded controller-side wheel allocation.
+
+    ``wheel_control_mask`` is FDIR-estimated authority, not simulator truth.  The
+    allocator solves directly for motor command using the effective wheel matrix
+    A*diag(authority), then performs a second residual-allocation pass after torque
+    clipping.  This avoids the old behavior in which a 10%-authority wheel was first
+    treated as fully capable and only compensated by asking for 10x more command.
+    """
     dtype = desired_body_torque.dtype
     axes = WHEEL_AXES.astype(dtype)
-    active = (wheel_control_mask > 1.0e-6).astype(dtype)
-    active_axes = axes[None, :, :] * active[..., None, :]
-
+    authority = jnp.clip(wheel_control_mask, 0.0, 1.0)
     predicted_friction = predicted_wheel_friction_torque(measured_wheel_speed, config)
-    passive_net = -predicted_friction * (1.0 - active)
-    passive_body = -jnp.einsum("ij,...j->...i", axes, passive_net)
-    active_target = desired_body_torque - passive_body
 
-    gram = active_axes @ jnp.swapaxes(active_axes, -1, -2)
+    # body torque = -A (authority*u - friction)
+    friction_body = jnp.einsum("ij,...j->...i", axes, predicted_friction)
+    motor_body_target = desired_body_torque - friction_body
+    effective_axes = axes[None, :, :] * authority[..., None, :]
     regularizer = config.allocation_regularization * jnp.eye(3, dtype=dtype)
-    solved = jnp.linalg.solve(gram + regularizer, active_target[..., None])
-    desired_net = -jnp.matmul(jnp.swapaxes(active_axes, -1, -2), solved)[..., 0] * active
 
-    desired_actual_motor = desired_net + predicted_friction * active
-    authority = jnp.maximum(wheel_control_mask, 1.0e-6)
-    command = jnp.where(active > 0.5, desired_actual_motor / authority, 0.0)
-    return jnp.clip(command, -config.max_motor_torque, config.max_motor_torque)
+    def solve(target: jax.Array, available: jax.Array) -> jax.Array:
+        matrix = effective_axes * available[..., None, :]
+        gram = matrix @ jnp.swapaxes(matrix, -1, -2)
+        solved = jnp.linalg.solve(gram + regularizer, target[..., None])
+        return -jnp.matmul(jnp.swapaxes(matrix, -1, -2), solved)[..., 0]
+
+    available0 = (authority > 1.0e-4).astype(dtype)
+    command0 = solve(motor_body_target, available0) * available0
+    command0 = jnp.clip(command0, -config.max_motor_torque, config.max_motor_torque)
+
+    predicted_net0 = authority * command0 - predicted_friction
+    predicted_body0 = -jnp.einsum("ij,...j->...i", axes, predicted_net0)
+    residual = desired_body_torque - predicted_body0
+
+    # Do not ask already saturated channels to absorb the residual.
+    unsaturated = (jnp.abs(command0) < (config.max_motor_torque - 1.0e-6)).astype(dtype) * available0
+    correction = solve(residual, unsaturated) * unsaturated
+    command = jnp.clip(command0 + correction, -config.max_motor_torque, config.max_motor_torque)
+    return jnp.where(available0 > 0.5, command, 0.0)
 
 
 def allocate_body_torque(
@@ -236,14 +254,17 @@ def physics_substep(
     external_body_torque: jax.Array,
     config: PhysicsConfig,
     measured_wheel_speed: jax.Array | None = None,
+    physical_wheel_authority: jax.Array | None = None,
 ) -> Tuple[PhysicalState, ActuationInfo]:
     if measured_wheel_speed is None:
         measured_wheel_speed = state.wheel_speed
     commanded = allocate_body_torque_command(
         desired_body_torque, measured_wheel_speed, wheel_control_mask, config
     )
+    if physical_wheel_authority is None:
+        physical_wheel_authority = wheel_control_mask
     motor, net = motor_torque_to_net_rotor_torque(
-        commanded, state.wheel_speed, wheel_control_mask, config,
+        commanded, state.wheel_speed, physical_wheel_authority, config,
         previous_motor_torque=state.motor_torque,
     )
     achieved = -jnp.einsum("ij,...j->...i", WHEEL_AXES.astype(desired_body_torque.dtype), net)
@@ -251,6 +272,7 @@ def physics_substep(
     return next_state, ActuationInfo(
         desired_body_torque=desired_body_torque,
         achieved_body_torque=achieved,
+        commanded_motor_torque=commanded,
         motor_torque=motor,
         net_rotor_torque=net,
         allocation_error=achieved - desired_body_torque,
@@ -275,6 +297,7 @@ def physics_substep_motor_direct(
     return next_state, ActuationInfo(
         desired_body_torque=implied_body,
         achieved_body_torque=achieved,
+        commanded_motor_torque=commanded_motor_torque,
         motor_torque=motor,
         net_rotor_torque=net,
         allocation_error=achieved - implied_body,

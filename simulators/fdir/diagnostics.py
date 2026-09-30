@@ -4,7 +4,7 @@ from dataclasses import replace
 import jax
 import jax.numpy as jnp
 
-from simulators.fdir.config import SensorConfig, WheelFaultConfig, default_config
+from simulators.fdir.config import SensorConfig, WheelFaultConfig, default_config, config_from_dict
 from simulators.fdir.env import SatelliteEnv
 from simulators.fdir.control import normalized_pd_body_action
 from simulators.fdir.evaluation import compare_baselines, evaluate_policy
@@ -22,11 +22,15 @@ from simulators.fdir.physics import (
     direct_motor_actuation,
     momentum_balance_residual,
 )
+from simulators.fdir.guidance import earth_fixed_position_eci, guidance_target
+from simulators.fdir.fdir import FAILED, update_fdir
+from simulators.fdir.orbit import reset_orbit_state
 
 
 def _assert_allclose(actual, expected, atol=1.0e-6, message=""):
     if not bool(jnp.allclose(actual, expected, atol=atol, rtol=0.0)):
         raise AssertionError(f"{message}\nactual={actual}\nexpected={expected}")
+
 
 
 def test_perfect_sensors_match_truth():
@@ -394,6 +398,97 @@ def run_ppo_smoke():
     print("PASS run_ppo_smoke")
 
 
+def _assert_close(a, b, tol=1e-5):
+    if not bool(jnp.all(jnp.abs(a - b) <= tol)):
+        raise AssertionError(f"not close: {a} vs {b}")
+
+
+def b2_diagnostics() -> None:
+    cfg = default_config()
+    orbit = reset_orbit_state(2, cfg.orbit)
+
+    # Improved inertial hold: target is configurable rather than hard-coded identity.
+    q_custom = (0.9238795, 0.0, 0.3826834, 0.0)
+    g = replace(cfg.guidance, mode="inertial_hold", inertial_target_q=q_custom)
+    tgt = guidance_target(orbit, g, cfg.orbit)
+    _assert_close(tgt.q_body_to_inertial[0], jnp.asarray(q_custom), 2e-5)
+    _assert_close(tgt.omega_inertial_rad_s, jnp.zeros((2, 3)))
+
+    # Earth-fixed target moves in ECI because Earth rotates.
+    p0, _, _ = earth_fixed_position_eci(jnp.asarray([0.0]), 0.0, 0.0, 0.0, cfg.orbit)
+    p1, _, _ = earth_fixed_position_eci(jnp.asarray([100.0]), 0.0, 0.0, 0.0, cfg.orbit)
+    if not float(jnp.linalg.norm(p1 - p0)) > 1_000.0:
+        raise AssertionError("Earth-fixed point did not rotate in ECI")
+
+    # Ground tracking has a moving reference even though the target is fixed on Earth.
+    gt = guidance_target(orbit, replace(cfg.guidance, mode="ground_target"), cfg.orbit)
+    if not bool(jnp.all(gt.reference_valid)):
+        raise AssertionError("initial equatorial target should be visible below initial spacecraft")
+    if not float(jnp.linalg.norm(gt.omega_inertial_rad_s[0])) > 1e-5:
+        raise AssertionError("ground-target reference rate incorrectly zero")
+
+    # Scheduled slew is stationary before start, moving during the slew, stationary after.
+    gs = replace(
+        cfg.guidance,
+        mode="scheduled_slew",
+        slew_start_seconds=1.0,
+        slew_max_rate_deg_s=2.0,
+        slew_max_accel_deg_s2=1.0,
+    )
+    before = guidance_target(orbit._replace(time_s=jnp.asarray([0.0, 0.0])), gs, cfg.orbit)
+    during = guidance_target(orbit._replace(time_s=jnp.asarray([5.0, 5.0])), gs, cfg.orbit)
+    after = guidance_target(orbit._replace(time_s=jnp.asarray([60.0, 60.0])), gs, cfg.orbit)
+    _assert_close(before.omega_inertial_rad_s, jnp.zeros((2, 3)))
+    if not float(jnp.linalg.norm(during.omega_inertial_rad_s[0])) > 1e-5:
+        raise AssertionError("scheduled slew has zero rate during maneuver")
+    _assert_close(after.omega_inertial_rad_s, jnp.zeros((2, 3)))
+
+    # Actor observation is invariant to simulator wheel-fault truth when FDIR belief is fixed.
+    env = SatelliteEnv(cfg)
+    state = env.reset(jax.random.PRNGKey(0), 2)
+    obs_a = env.observe(state)
+    fake_truth = state._replace(wheel_mask=jnp.zeros_like(state.wheel_mask))
+    obs_b = env.observe(fake_truth)
+    _assert_close(obs_a, obs_b, 0.0)
+
+    # Synthetic analytical-redundancy test: commanded wheel 0 has zero tach
+    # acceleration while other wheels respond. FDIR must infer wheel-0 authority
+    # loss without reading env.wheel_mask.
+    f = state.fdir
+    sensors = state.sensors
+    estimator = state.estimator
+    command = jnp.full((2, 4), 0.015, jnp.float32)
+    speed = jnp.zeros((2, 4), jnp.float32)
+    for k in range(1, 45):
+        speed = speed.at[:, 1:].add(
+            (0.015 / cfg.physics.wheel_inertia) * cfg.physics.physics_dt
+        )
+        sensors = sensors._replace(
+            wheel_speed=speed,
+            wheel_valid=jnp.ones_like(sensors.wheel_valid),
+            wheel_sample_step=jnp.full_like(sensors.wheel_sample_step, k),
+        )
+        f = update_fdir(
+            f, sensors, estimator, command, jnp.full((2,), k, jnp.int32),
+            cfg.physics, cfg.sensors, cfg.estimator, cfg.fdir,
+        )
+    if not bool(jnp.all(f.wheel_motor_health[:, 0] == FAILED)):
+        raise AssertionError("wheel-response FDIR failed to isolate synthetic dead motor")
+    if not bool(jnp.all(f.wheel_authority_estimate[:, 0] < 0.10)):
+        raise AssertionError("wheel authority estimate did not converge toward zero")
+
+    # Old checkpoint configs that said `truth` are migrated to FDIR semantics while
+    # retaining the same 4-value observation width.
+    import dataclasses
+    data = dataclasses.asdict(cfg)
+    data["observation"]["wheel_mask_source"] = "truth"
+    migrated = config_from_dict(data)
+    if migrated.observation.wheel_mask_source != "fdir":
+        raise AssertionError("legacy truth mask was not migrated to FDIR authority")
+
+    print("B.2 diagnostics passed")
+
+
 def run_all():
     tests = [
         test_perfect_sensors_match_truth,
@@ -412,6 +507,7 @@ def run_all():
         test_fixed_interval_fault_schedule,
         test_pd_baseline_and_reward_ordering,
         test_end_to_end_residual_policy,
+        b2_diagnostics,
     ]
     for test in tests:
         test()

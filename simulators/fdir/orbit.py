@@ -56,9 +56,11 @@ def magnetic_dipole_axis_eci(config: OrbitConfig, dtype=jnp.float32) -> jax.Arra
 
 
 def magnetic_field_eci(position_eci_m: jax.Array, config: OrbitConfig) -> jax.Array:
-    """Centered-dipole magnetic field in ECI, ``magnetic_equator_field_t`` is 
-    the surface equatorial magnitude. This is a deliberately compact reference 
-    model suitable for estimator integration tests.
+    """Centered-dipole magnetic field in ECI, in tesla.
+
+    ``magnetic_equator_field_t`` is the surface equatorial magnitude.  This is a
+    deliberately compact reference model suitable for estimator integration
+    tests; it is not a replacement for IGRF/WMM in later fidelity stages.
     """
     dtype = position_eci_m.dtype
     radius = jnp.linalg.norm(position_eci_m, axis=-1, keepdims=True)

@@ -11,8 +11,10 @@ from simulators.fdir.estimator import (
     gyro_bias_sigma_rad_s,
     reset_estimator_state,
 )
-from simulators.fdir.math3d import attitude_error, axis_angle_to_quat, sample_quaternion_in_cone, quat_multiply, rotate_inertial_to_body
-from simulators.fdir.guidance import guidance_target, tracking_rate_error_body
+from simulators.fdir.math3d import attitude_error, axis_angle_to_quat, sample_quaternion_in_cone, quat_multiply, rotate_body_to_inertial, rotate_inertial_to_body
+from simulators.fdir.guidance import GuidanceTarget, body_axis_vector, guidance_target, safe_sun_target, tracking_rate_error_body
+from simulators.fdir.fdir import FAILED, FDIRState, filter_sensors_for_estimator, reset_fdir_state, update_fdir
+from simulators.fdir.supervisor import SAFE_SUN, SupervisorState, mode_one_hot, reset_supervisor_state, update_supervisor
 from simulators.fdir.orbit import OrbitState, orbit_substep, reset_orbit_state
 from simulators.fdir.physics import (
     PhysicalState,
@@ -33,6 +35,8 @@ class EnvState(NamedTuple):
     orbit: OrbitState
     sensors: SensorState
     estimator: EstimatorState
+    fdir: FDIRState
+    supervisor: SupervisorState
     target_q: jax.Array
     target_omega_inertial: jax.Array
     wheel_mask: jax.Array
@@ -62,7 +66,21 @@ class StepInfo(NamedTuple):
     motor_torque_max: jax.Array
     wheel_speed_fraction_max: jax.Array
     settled: jax.Array
+    # Simulator truth is retained in diagnostics only, never actor/control logic.
     wheel_mask: jax.Array
+    estimated_wheel_authority: jax.Array
+    wheel_speed_margin: jax.Array
+    wheel_motor_health: jax.Array
+    wheel_tach_health: jax.Array
+    star_health: jax.Array
+    magnetometer_health: jax.Array
+    sun_health: jax.Array
+    gnss_health: jax.Array
+    estimator_confidence: jax.Array
+    supervisory_mode: jax.Array
+    target_reference_valid: jax.Array
+    pointing_axis_error_rad: jax.Array
+    target_in_beam: jax.Array
     gyro_measurement: jax.Array
     wheel_speed_measurement: jax.Array
     star_tracker_measurement: jax.Array
@@ -116,7 +134,22 @@ class SatelliteEnv:
             obs_size += self.action_size
         if config.observation.include_wheel_mask:
             obs_size += 4
+        if config.observation.include_estimator_confidence:
+            obs_size += 1
+        if config.observation.include_supervisory_mode:
+            obs_size += 6
         self.observation_size = obs_size
+
+    def _commanded_guidance(self, orbit: OrbitState, supervisor_mode: jax.Array) -> GuidanceTarget:
+        mission = guidance_target(orbit, self.config.guidance, self.config.orbit)
+        safe = safe_sun_target(orbit, self.config.guidance)
+        use_safe = supervisor_mode == SAFE_SUN
+        return GuidanceTarget(
+            q_body_to_inertial=jnp.where(use_safe[:, None], safe.q_body_to_inertial, mission.q_body_to_inertial),
+            omega_inertial_rad_s=jnp.where(use_safe[:, None], safe.omega_inertial_rad_s, mission.omega_inertial_rad_s),
+            reference_valid=jnp.where(use_safe, safe.reference_valid, mission.reference_valid),
+            reference_direction_eci=jnp.where(use_safe[:, None], safe.reference_direction_eci, mission.reference_direction_eci),
+        )
 
     def _sample_fault_wheel(self, key: jax.Array, batch_size: int) -> jax.Array:
         fault = self.config.faults
@@ -242,7 +275,8 @@ class SatelliteEnv:
         key_q, key_omega, key_fault, key_sensor = jax.random.split(key, 4)
 
         orbit = reset_orbit_state(batch_size, self.config.orbit)
-        target = guidance_target(orbit, self.config.guidance)
+        mission_target = guidance_target(orbit, self.config.guidance)
+        target = mission_target
 
         if task.reset_mode == "fixed":
             axis = jnp.asarray(task.fixed_axis, dtype=jnp.float32)
@@ -296,11 +330,18 @@ class SatelliteEnv:
             sensors, self.config.physics, self.config.sensors,
             self.config.orbit, self.config.estimator
         )
+        fdir = reset_fdir_state(sensors, estimator, self.config.fdir)
+        supervisor = reset_supervisor_state(
+            estimator, fdir, self.config.physics, self.config.fdir, self.config.supervisor
+        )
+        target = self._commanded_guidance(orbit, supervisor.mode)
         return EnvState(
             physical=physical,
             orbit=orbit,
             sensors=sensors,
             estimator=estimator,
+            fdir=fdir,
+            supervisor=supervisor,
             target_q=target.q_body_to_inertial,
             target_omega_inertial=target.omega_inertial_rad_s,
             wheel_mask=wheel_mask,
@@ -337,10 +378,14 @@ class SatelliteEnv:
         if self.config.observation.include_previous_action:
             fields.append(state.previous_action)
         if self.config.observation.include_wheel_mask:
-            if self.config.observation.wheel_mask_source == "truth":
-                fields.append(state.wheel_mask)
+            if self.config.observation.wheel_mask_source == "fdir":
+                fields.append(state.fdir.wheel_authority_estimate)
             else:
-                fields.append(jnp.ones_like(state.wheel_mask))
+                fields.append(jnp.ones_like(state.fdir.wheel_authority_estimate))
+        if self.config.observation.include_estimator_confidence:
+            fields.append(state.fdir.estimator_confidence[:, None])
+        if self.config.observation.include_supervisory_mode:
+            fields.append(mode_one_hot(state.supervisor.mode, dtype=attitude_vector.dtype))
         return jnp.concatenate(fields, axis=-1)
 
     def step(
@@ -362,10 +407,15 @@ class SatelliteEnv:
             commanded_motor_torque = action * p.motor_control_limit
 
             def substep(carry, substep_index):
-                physical, orbit, sensors, estimator = carry
+                physical, orbit, sensors, estimator, fdir = carry
+                flight_motor_command = jnp.where(
+                    fdir.wheel_motor_health == FAILED,
+                    0.0,
+                    commanded_motor_torque,
+                )
                 next_physical, actuation = physics_substep_motor_direct(
                     physical,
-                    commanded_motor_torque,
+                    flight_motor_command,
                     state.wheel_mask,
                     external_body_torque,
                     p,
@@ -381,10 +431,11 @@ class SatelliteEnv:
                     p,
                     self.config.orbit,
                 )
+                estimator_sensors = filter_sensors_for_estimator(next_sensors, fdir)
                 if self.config.estimator.enabled:
                     next_estimator = estimator_substep(
                         estimator,
-                        next_sensors,
+                        estimator_sensors,
                         absolute_step,
                         p,
                         self.config.sensors,
@@ -393,6 +444,10 @@ class SatelliteEnv:
                     )
                 else:
                     next_estimator = estimator
+                next_fdir = update_fdir(
+                    fdir, next_sensors, next_estimator, actuation.commanded_motor_torque,
+                    absolute_step, p, self.config.sensors, self.config.estimator, self.config.fdir,
+                )
                 events = EstimatorEvents(
                     star_tracker_processed=(
                         next_estimator.last_star_tracker_step
@@ -429,21 +484,22 @@ class SatelliteEnv:
                     ),
                 )
                 return (
-                    next_physical, next_orbit, next_sensors, next_estimator
+                    next_physical, next_orbit, next_sensors, next_estimator, next_fdir
                 ), (actuation, events)
         else:
             torque_limit = jnp.asarray(p.body_torque_limit, dtype=action.dtype)
             desired_body_torque = action * torque_limit
 
             def substep(carry, substep_index):
-                physical, orbit, sensors, estimator = carry
+                physical, orbit, sensors, estimator, fdir = carry
                 next_physical, actuation = physics_substep(
                     physical,
                     desired_body_torque,
-                    state.wheel_mask,
+                    fdir.wheel_authority_estimate,
                     external_body_torque,
                     p,
                     measured_wheel_speed=sensors.wheel_speed,
+                    physical_wheel_authority=state.wheel_mask,
                 )
                 next_orbit = orbit_substep(orbit, p.physics_dt, self.config.orbit)
                 absolute_step = base_physics_step + substep_index + 1
@@ -456,10 +512,11 @@ class SatelliteEnv:
                     p,
                     self.config.orbit,
                 )
+                estimator_sensors = filter_sensors_for_estimator(next_sensors, fdir)
                 if self.config.estimator.enabled:
                     next_estimator = estimator_substep(
                         estimator,
-                        next_sensors,
+                        estimator_sensors,
                         absolute_step,
                         p,
                         self.config.sensors,
@@ -468,6 +525,10 @@ class SatelliteEnv:
                     )
                 else:
                     next_estimator = estimator
+                next_fdir = update_fdir(
+                    fdir, next_sensors, next_estimator, actuation.commanded_motor_torque,
+                    absolute_step, p, self.config.sensors, self.config.estimator, self.config.fdir,
+                )
                 events = EstimatorEvents(
                     star_tracker_processed=(
                         next_estimator.last_star_tracker_step
@@ -504,7 +565,7 @@ class SatelliteEnv:
                     ),
                 )
                 return (
-                    next_physical, next_orbit, next_sensors, next_estimator
+                    next_physical, next_orbit, next_sensors, next_estimator, next_fdir
                 ), (actuation, events)
 
         (
@@ -512,14 +573,18 @@ class SatelliteEnv:
             next_orbit,
             next_sensors,
             next_estimator,
+            next_fdir,
         ), (actuation_sequence, estimator_events) = jax.lax.scan(
             substep,
-            (state.physical, state.orbit, state.sensors, state.estimator),
+            (state.physical, state.orbit, state.sensors, state.estimator, state.fdir),
             substep_indices,
         )
 
 
-        next_target = guidance_target(next_orbit, self.config.guidance)
+        next_supervisor = update_supervisor(
+            state.supervisor, next_estimator, next_fdir, p, self.config.fdir, self.config.supervisor
+        )
+        next_target = self._commanded_guidance(next_orbit, next_supervisor.mode)
         previous_error_q = attitude_error(state.target_q, state.physical.q)
         error_q = attitude_error(next_target.q_body_to_inertial, next_physical.q)
         true_rate_error = tracking_rate_error_body(
@@ -554,6 +619,8 @@ class SatelliteEnv:
             orbit=next_orbit,
             sensors=next_sensors,
             estimator=next_estimator,
+            fdir=next_fdir,
+            supervisor=next_supervisor,
             target_q=next_target.q_body_to_inertial,
             target_omega_inertial=next_target.omega_inertial_rad_s,
             wheel_mask=next_mask,
@@ -574,6 +641,23 @@ class SatelliteEnv:
         sensor_ages = sensor_age_seconds(
             next_sensors, absolute_next_physics_step, p
         )
+        axis_name = (
+            self.config.guidance.earth_tracking_body_axis
+            if self.config.guidance.mode in ("ground_target", "ground_station")
+            else self.config.guidance.sun_pointing_body_axis
+            if self.config.guidance.mode == "sun_pointing"
+            else "+Z"
+        )
+        body_axis = jnp.broadcast_to(
+            body_axis_vector(axis_name, next_physical.q.dtype), next_physical.omega.shape
+        )
+        actual_axis_eci = rotate_body_to_inertial(next_physical.q, body_axis)
+        axis_dot = jnp.sum(actual_axis_eci * next_target.reference_direction_eci, axis=-1)
+        pointing_axis_error = jnp.arccos(jnp.clip(axis_dot, -1.0, 1.0))
+        target_in_beam = (
+            next_target.reference_valid
+            & (pointing_axis_error <= jnp.deg2rad(self.config.guidance.antenna_half_beamwidth_deg))
+        )
         info = StepInfo(
             reward_terms=reward_terms,
             desired_body_torque=last_actuation.desired_body_torque,
@@ -588,6 +672,19 @@ class SatelliteEnv:
             ),
             settled=settled,
             wheel_mask=state.wheel_mask,
+            estimated_wheel_authority=next_fdir.wheel_authority_estimate,
+            wheel_speed_margin=next_fdir.wheel_speed_margin,
+            wheel_motor_health=next_fdir.wheel_motor_health,
+            wheel_tach_health=next_fdir.wheel_tach_health,
+            star_health=next_fdir.star_health,
+            magnetometer_health=next_fdir.magnetometer_health,
+            sun_health=next_fdir.sun_health,
+            gnss_health=next_fdir.gnss_health,
+            estimator_confidence=next_fdir.estimator_confidence,
+            supervisory_mode=next_supervisor.mode,
+            target_reference_valid=next_target.reference_valid,
+            pointing_axis_error_rad=pointing_axis_error,
+            target_in_beam=target_in_beam,
             gyro_measurement=next_sensors.gyro,
             wheel_speed_measurement=next_sensors.wheel_speed,
             star_tracker_measurement=next_sensors.star_tracker_q,
