@@ -130,7 +130,8 @@ class OrbitConfig:
     magnetic_equator_field_t: float = 3.12e-5
     magnetic_dipole_tilt_deg: float = 11.0
     magnetic_dipole_longitude_deg: float = 0.0
-
+    earth_rotation_rate_rad_s: float = 7.2921150e-5
+    initial_greenwich_angle_deg: float = 0.0
     # Earth-to-Sun unit direction in ECI, treated as constant over one episode.
     sun_direction_eci: Tuple[float, float, float] = (1.0, 0.0, 0.0) #fall
 
@@ -309,6 +310,8 @@ class FDIRConfig:
 
     enabled: bool = True
     wheel_authority_ewma_alpha: float = 0.08
+    wheel_authority_window_seconds: float = 0.40
+    wheel_authority_min_samples: int = 12
     wheel_min_excitation_torque: float = 0.006
     wheel_degraded_authority: float = 0.80
     wheel_failed_authority: float = 0.15
@@ -419,6 +422,7 @@ class RunConfig:
     output_dir: str = "output/satellite_reference"
     video_diagnostic_pages: bool = False
     video_history_seconds: float = 10.0
+    load_params_path: str = ""
 
 
 @dataclass(frozen=True)

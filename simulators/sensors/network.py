@@ -12,8 +12,6 @@ def make_network(
     action_size: int,
     config: NetworkConfig,
 ):
-    del observation_size  # Shape is inferred by Haiku at initialization.
-
     def activation(x: jax.Array) -> jax.Array:
         if config.activation == "tanh":
             return jnp.tanh(x)

@@ -44,6 +44,12 @@ def save_checkpoint(path: Path, train_state: TrainState, config: ExperimentConfi
     with path.open("wb") as handle:
         pickle.dump(payload, handle)
 
+def load_checkpoint(path: Path):
+    with open(path, "rb") as handle:
+        state = pickle.load(handle)
+
+    return state
+
 
 def train(config: ExperimentConfig) -> TrainState:
     output_dir = Path(config.run.output_dir)
@@ -62,6 +68,11 @@ def train(config: ExperimentConfig) -> TrainState:
     dummy_state = env.reset(dummy_reset_key, 1)
     dummy_obs = env.observe(dummy_state)
     params = network.init(init_key, dummy_obs)
+
+    if config.run.load_params_path != "":
+        _state = load_checkpoint(config.run.load_params_path)
+        train_state = TrainState(_state['params'], _state['opt_state'])
+        print(f'Loaded parameters from {config.run.load_params_path} to the model')
 
     optimizer = make_optimizer(config)
     train_state = TrainState(params=params, opt_state=optimizer.init(params))
@@ -180,6 +191,7 @@ def train(config: ExperimentConfig) -> TrainState:
 
 def parse_config() -> ExperimentConfig:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--load-from-existing", type=str, default=None)
     parser.add_argument("--updates", type=int, default=None)
     parser.add_argument("--num-envs", type=int, default=None)
     parser.add_argument("--eval-envs", type=int, default=None)
@@ -258,6 +270,8 @@ def parse_config() -> ExperimentConfig:
     args = parser.parse_args()
 
     config = default_config()
+    if args.load_from_existing is not None:
+        config = replace(config, run=replace(config.run, load_params_path=args.load_from_existing))
     if args.updates is not None:
         config = replace(config, run=replace(config.run, total_updates=args.updates))
     if args.num_envs is not None:

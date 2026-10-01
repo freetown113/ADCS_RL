@@ -3,7 +3,7 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 
-from simulators.simplified.config import ExperimentConfig, validate_config
+from simulators.simplified.config import ExperimentConfig
 from simulators.simplified.math3d import attitude_error, axis_angle_to_quat, sample_quaternion_in_cone
 from simulators.simplified.physics import (
     PhysicalState,
@@ -39,7 +39,6 @@ class StepInfo(NamedTuple):
 
 class SatelliteEnv:
     def __init__(self, config: ExperimentConfig):
-        validate_config(config)
         self.config = config
         p = config.physics
         t = config.task

@@ -93,7 +93,7 @@ def earth_eclipse_mask(
 
 
 
-def orbit_state_at_time(time_s: Array, config: OrbitConfig) -> OrbitState:
+def orbit_state_at_time(time_s: jax.Array, config: OrbitConfig) -> OrbitState:
     """Exact configured circular-orbit state at arbitrary absolute episode time(s).
 
     This is used both by the JAX environment reset curricula and by host-side

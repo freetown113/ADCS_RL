@@ -98,11 +98,11 @@ class StepInfo(NamedTuple):
     gnss_health: jax.Array
     estimator_confidence: jax.Array
     supervisory_mode: jax.Array
-    mission_phase: Array
-    target_elevation_rad: Array
-    magnetorquer_commanded_dipole_Am2: Array
-    magnetorquer_actual_dipole_Am2: Array
-    magnetorquer_torque_body_Nm: Array
+    mission_phase: jax.Array
+    target_elevation_rad: jax.Array
+    magnetorquer_commanded_dipole_Am2: jax.Array
+    magnetorquer_actual_dipole_Am2: jax.Array
+    magnetorquer_torque_body_Nm: jax.Array
     target_reference_valid: jax.Array
     pointing_axis_error_rad: jax.Array
     target_in_beam: jax.Array
@@ -114,8 +114,8 @@ class StepInfo(NamedTuple):
     gnss_position_measurement: jax.Array
     gnss_velocity_measurement: jax.Array
     gnss_time_measurement: jax.Array
-    gyro_valid: Array
-    wheel_valid: Array
+    gyro_valid: jax.Array
+    wheel_valid: jax.Array
     star_tracker_valid: jax.Array
     magnetometer_valid: jax.Array
     sun_sensor_valid: jax.Array
@@ -182,7 +182,7 @@ class SatelliteEnv:
             obs_size += 6
         self.observation_size = obs_size
 
-    def _safe_override(self, mission_target: GuidanceTarget, orbit: OrbitState, supervisor_mode: Array) -> GuidanceTarget:
+    def _safe_override(self, mission_target: GuidanceTarget, orbit: OrbitState, supervisor_mode: jax.Array) -> GuidanceTarget:
         safe = safe_sun_target(orbit, self.config.guidance)
         use_safe = supervisor_mode == SAFE_SUN
         return GuidanceTarget(

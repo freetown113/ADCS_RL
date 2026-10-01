@@ -153,7 +153,7 @@ def save_trajectory_video(
                 label = (
                     f"motor {axis + 1}"
                     if env.config.control.mode == "motor_direct"
-                    else f"body {"XYZ"[axis]}"
+                    else f"body {'XYZ'[axis]}"
                 )
                 ax_action.plot(time[:stop], tr.command_action[:stop, axis], label=label)
             ax_action.set_ylim(-1.05, 1.05)

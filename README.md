@@ -4,3 +4,13 @@
 
 
 The project evolves, current stage demonstrates a satellite's attitude control subsystem. It does not yet demonstrate docking or manipulation. Principal milestones are described in project_evolution.md file. 
+
+
+### Train agent from scratch
+python -m simulators.fdir.train --guidance-mode ground_station --target-lat-deg 8.49 --target-lon-deg -13.23 --orbit-inclination-deg 10.0 --orbit-raan-deg 288.93 --orbit-argument-latitude-deg 58.23 --ground-pass-reset-mode pass_centered
+
+### Train agent from checkpoint
+python -m simulators.fdir.train --guidance-mode ground_station --target-lat-deg 8.49 --target-lon-deg -13.23 --orbit-inclination-deg 10.0 --orbit-raan-deg 288.93 --orbit-argument-latitude-deg 58.23 --ground-pass-reset-mode random_visible --load-from-existing satellite_reference/checkpoints/update_0009650.pkl
+
+### Evaluate agent
+python -m simulators.fdir.evaluate_checkpoint atellite_reference/checkpoints/update_0009650.pkl --video eval_output/agent_ground_station_performance.mp4 --eval-envs 10
