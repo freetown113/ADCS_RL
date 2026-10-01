@@ -169,7 +169,7 @@ def earth_target_line_of_sight(
     return los_hat, visible, target_v, target_a
 
 
-def _earth_tracking_target(
+def earth_tracking_target(
     orbit: OrbitState,
     config: GuidanceConfig,
     orbit_config: OrbitConfig,
@@ -223,11 +223,28 @@ def _earth_tracking_target(
     target_up = _normalize(target_r)
     visible = jnp.sum((r_s - target_r) * target_up, axis=-1) > 0.0
 
-    fallback = _nadir_target(orbit) if config.earth_target_fallback_mode == "nadir_lvlh" else _inertial_target(orbit, config)
-    q = jnp.where(visible[:, None], q_track, fallback.q_body_to_inertial)
-    omega = jnp.where(visible[:, None], omega_i, fallback.omega_inertial_rad_s)
-    direction = jnp.where(visible[:, None], z_i, fallback.reference_direction_eci)
-    return GuidanceTarget(q, omega, visible, direction)
+    return GuidanceTarget(q_track, omega_i, visible, z_i)
+
+
+def fallback_target(orbit: OrbitState, config: GuidanceConfig) -> GuidanceTarget:
+    """Configured standby reference used around Earth-fixed passes."""
+    return _nadir_target(orbit) if config.earth_target_fallback_mode == "nadir_lvlh" else _inertial_target(orbit, config)
+
+
+def earth_target_elevation_rad(
+    orbit: OrbitState,
+    config: GuidanceConfig,
+    orbit_config: OrbitConfig,
+) -> jax.Array:
+    """Elevation of the spacecraft as seen from the configured ground object."""
+    target_r, _, _ = earth_fixed_position_eci(
+        orbit.time_s, config.earth_target_lat_deg, config.earth_target_lon_deg,
+        config.earth_target_alt_m, orbit_config, orbit.position_eci_m.dtype,
+    )
+    rho = orbit.position_eci_m - target_r
+    up = _normalize(target_r)
+    sine_elevation = jnp.sum(rho * up, axis=-1) / (jnp.linalg.norm(rho, axis=-1) + 1.0e-12)
+    return jnp.arcsin(jnp.clip(sine_elevation, -1.0, 1.0))
 
 
 def _sun_target(orbit: OrbitState, config: GuidanceConfig) -> GuidanceTarget:
@@ -308,7 +325,7 @@ def guidance_target(
     if config.mode in ("ground_target", "ground_station"):
         if orbit_config is None:
             raise ValueError("Earth-fixed guidance requires OrbitConfig")
-        return _earth_tracking_target(orbit, config, orbit_config)
+        return earth_tracking_target(orbit, config, orbit_config)
     if config.mode == "sun_pointing":
         return _sun_target(orbit, config)
     if config.mode == "scheduled_slew":

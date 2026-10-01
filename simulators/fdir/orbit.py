@@ -92,35 +92,32 @@ def earth_eclipse_mask(
     return (along_sun < 0.0) & (distance_to_axis < config.earth_radius_m)
 
 
-def reset_orbit_state(batch_size: int, config: OrbitConfig) -> OrbitState:
-    dtype = jnp.float32
-    p_hat, q_hat = _orbit_basis(config, dtype)
-    phase = jnp.deg2rad(
-        jnp.asarray(config.initial_argument_of_latitude_deg, dtype=dtype)
-    )
-    radius = jnp.asarray(config.earth_radius_m + config.altitude_m, dtype=dtype)
-    speed = jnp.sqrt(jnp.asarray(config.earth_mu_m3_s2, dtype=dtype) / radius)
 
-    position_single = radius * (
-        jnp.cos(phase) * p_hat + jnp.sin(phase) * q_hat
-    )
-    velocity_single = speed * (
-        -jnp.sin(phase) * p_hat + jnp.cos(phase) * q_hat
-    )
-    position = jnp.broadcast_to(position_single, (batch_size, 3))
-    velocity = jnp.broadcast_to(velocity_single, (batch_size, 3))
-    sun_single = sun_direction_eci(config, dtype)
-    sun = jnp.broadcast_to(sun_single, (batch_size, 3))
+def orbit_state_at_time(time_s: Array, config: OrbitConfig) -> OrbitState:
+    """Exact configured circular-orbit state at arbitrary absolute episode time(s).
+
+    This is used both by the JAX environment reset curricula and by host-side
+    ground-pass planning.  It is the same two-body circular model as
+    :func:`orbit_substep`, not a separate propagator.
+    """
+    time_s = jnp.asarray(time_s, dtype=jnp.float32)
+    p_hat, q_hat = _orbit_basis(config, time_s.dtype)
+    radius = jnp.asarray(config.earth_radius_m + config.altitude_m, dtype=time_s.dtype)
+    mean_motion = jnp.sqrt(jnp.asarray(config.earth_mu_m3_s2, dtype=time_s.dtype) / radius**3)
+    phase0 = jnp.deg2rad(jnp.asarray(config.initial_argument_of_latitude_deg, dtype=time_s.dtype))
+    phase = phase0 + mean_motion * time_s
+    position = radius * (jnp.cos(phase)[..., None] * p_hat + jnp.sin(phase)[..., None] * q_hat)
+    speed = jnp.sqrt(jnp.asarray(config.earth_mu_m3_s2, dtype=time_s.dtype) / radius)
+    velocity = speed * (-jnp.sin(phase)[..., None] * p_hat + jnp.cos(phase)[..., None] * q_hat)
+    sun_single = sun_direction_eci(config, time_s.dtype)
+    sun = jnp.broadcast_to(sun_single, position.shape)
     field = magnetic_field_eci(position, config)
     visible = ~earth_eclipse_mask(position, sun, config)
-    return OrbitState(
-        position_eci_m=position,
-        velocity_eci_m_s=velocity,
-        time_s=jnp.zeros((batch_size,), dtype=dtype),
-        magnetic_field_eci_t=field,
-        sun_direction_eci=sun,
-        sun_visible=visible,
-    )
+    return OrbitState(position, velocity, time_s, field, sun, visible)
+
+
+def reset_orbit_state(batch_size: int, config: OrbitConfig) -> OrbitState:
+    return orbit_state_at_time(jnp.zeros((batch_size,), dtype=jnp.float32), config)
 
 
 def _rotate_about_axis(vector: jax.Array, axis: jax.Array, angle: jax.Array) -> jax.Array:
