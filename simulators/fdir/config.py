@@ -12,6 +12,7 @@ FaultMode = Literal[
     "stochastic",
 ]
 WheelSelection = Literal["fixed", "random"]
+GroundPassResetMode = Literal["configured", "pass_centered", "random_visible"]
 GuidanceMode = Literal[
     "inertial_hold",
     "nadir_lvlh",
@@ -262,6 +263,42 @@ class GuidanceConfig:
     slew_max_rate_deg_s: float = 2.0
     slew_max_accel_deg_s2: float = 0.5
 
+@dataclass(frozen=True)
+class MissionConfig:
+    """Mission-level ground-pass scheduling and training curricula.
+    These parameters change *when* Earth-fixed tracking is commanded, not the
+    physical ground-target/station geometry itself.
+    """
+    ground_pass_enabled: bool = True
+    ground_pass_reset_mode: GroundPassResetMode = "configured"
+    ground_pass_enter_elevation_deg: float = 5.0
+    ground_pass_exit_elevation_deg: float = 2.0
+    ground_pass_enter_dwell_seconds: float = 0.25
+    ground_pass_exit_dwell_seconds: float = 0.50
+    ground_pass_pre_slew_seconds: float = 30.0
+    ground_pass_post_slew_seconds: float = 20.0
+    ground_pass_slew_max_rate_deg_s: float = 5.0
+    ground_pass_slew_max_accel_deg_s2: float = 1.0
+    ground_pass_catch_angle_deg: float = 0.25
+    ground_pass_search_orbits: float = 4.0
+    ground_pass_search_step_seconds: float = 1.0
+
+
+@dataclass(frozen=True)
+class MagnetorquerConfig:
+    """Conventional three-axis magnetic-torquer actuator and flight-law limits."""
+
+    enabled: bool = True
+    max_dipole_Am2: float = 1.0
+    dipole_quantization_Am2: float = 1.0e-3
+    time_constant_s: float = 0.05
+    minimum_field_t: float = 1.0e-7
+
+    # m ~= k_B (omega x B) for gyro-aided B-dot detumbling.
+    bdot_gain_Am2_s_per_t: float = 2.0e5
+    # desired momentum-dump torque tau*=-k_h h_w.
+    momentum_unload_gain_per_s: float = 5.0e-5
+
 
 @dataclass(frozen=True)
 class FDIRConfig:
@@ -272,7 +309,7 @@ class FDIRConfig:
 
     enabled: bool = True
     wheel_authority_ewma_alpha: float = 0.08
-    wheel_min_excitation_torque: float = 0.003
+    wheel_min_excitation_torque: float = 0.006
     wheel_degraded_authority: float = 0.80
     wheel_failed_authority: float = 0.15
     wheel_recovery_authority: float = 0.90
@@ -310,6 +347,18 @@ class SupervisorConfig:
     wheel_speed_degraded_fraction: float = 0.90
     wheel_speed_critical_fraction: float = 0.98
 
+    autonomous_detumble_enabled: bool = False
+    detumble_enter_rate_deg_s: float = 5.0
+    detumble_exit_rate_deg_s: float = 0.5
+    detumble_enter_dwell_seconds: float = 0.25
+    detumble_exit_dwell_seconds: float = 2.0
+
+    autonomous_momentum_unload_enabled: bool = True
+    momentum_unload_enter_fraction: float = 0.85
+    momentum_unload_exit_fraction: float = 0.55
+    momentum_unload_enter_dwell_seconds: float = 0.50
+    momentum_unload_exit_dwell_seconds: float = 2.0
+
 
 @dataclass(frozen=True)
 class ObservationConfig:
@@ -319,6 +368,7 @@ class ObservationConfig:
     wheel_mask_source: Literal["fdir", "unknown"] = "fdir"
     include_estimator_confidence: bool = False
     include_supervisory_mode: bool = False
+
 
 @dataclass(frozen=True)
 class RewardConfig:
@@ -367,6 +417,8 @@ class RunConfig:
     video_every: int = 250
     eval_envs: int = 512
     output_dir: str = "output/satellite_reference"
+    video_diagnostic_pages: bool = False
+    video_history_seconds: float = 10.0
 
 
 @dataclass(frozen=True)
@@ -379,6 +431,8 @@ class ExperimentConfig:
     sensors: SensorConfig = field(default_factory=SensorConfig)
     estimator: EstimatorConfig = field(default_factory=EstimatorConfig)
     guidance: GuidanceConfig = field(default_factory=GuidanceConfig)
+    mission: MissionConfig = field(default_factory=MissionConfig)
+    magnetorquer: MagnetorquerConfig = field(default_factory=MagnetorquerConfig)
     fdir: FDIRConfig = field(default_factory=FDIRConfig)
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
     observation: ObservationConfig = field(default_factory=ObservationConfig)
@@ -410,6 +464,8 @@ def config_from_dict(data: dict) -> ExperimentConfig:
         sensors=SensorConfig(**data.get("sensors", {})),
         estimator=estimator,
         guidance=GuidanceConfig(**data.get("guidance", {})),
+        mission=MissionConfig(**data.get("mission", {})),
+        magnetorquer=MagnetorquerConfig(**data.get("magnetorquer", {})),
         fdir=FDIRConfig(**data.get("fdir", ({"enabled": False} if legacy_without_estimator else {}))),
         supervisor=SupervisorConfig(**data.get("supervisor", ({"enabled": False} if legacy_without_estimator else {}))),
         observation=ObservationConfig(**({
@@ -427,7 +483,7 @@ def config_from_dict(data: dict) -> ExperimentConfig:
 
 
 def validate_config(config: ExperimentConfig) -> None:
-    p, t, o, r, c, f, orbit, s, ppo, e, g, fd, sup = (
+    p, t, o, r, c, f, orbit, s, ppo, e, g, mission, mtq, fd, sup = (
         config.physics,
         config.task,
         config.observation,
@@ -439,6 +495,8 @@ def validate_config(config: ExperimentConfig) -> None:
         config.ppo,
         config.estimator,
         config.guidance,
+        config.mission,
+        config.magnetorquer,
         config.fdir,
         config.supervisor,
     )
@@ -491,10 +549,28 @@ def validate_config(config: ExperimentConfig) -> None:
         norm2 = sum(value * value for value in quat)
         if norm2 <= 1.0e-12:
             raise ValueError(f"{name} must be non-zero")
+    if mission.ground_pass_reset_mode not in ("configured", "pass_centered", "random_visible"):
+        raise ValueError("unsupported ground_pass_reset_mode")
+    if not (mission.ground_pass_exit_elevation_deg < mission.ground_pass_enter_elevation_deg < 90.0):
+        raise ValueError("ground-pass exit elevation must be below enter elevation")
+    if min(mission.ground_pass_enter_dwell_seconds, mission.ground_pass_exit_dwell_seconds, mission.ground_pass_pre_slew_seconds, mission.ground_pass_post_slew_seconds) < 0.0:
+        raise ValueError("ground-pass dwell/lookahead times must be non-negative")
+    if mission.ground_pass_slew_max_rate_deg_s <= 0.0 or mission.ground_pass_slew_max_accel_deg_s2 <= 0.0:
+        raise ValueError("ground-pass slew rate/acceleration must be positive")
+    if mission.ground_pass_catch_angle_deg <= 0.0:
+        raise ValueError("ground_pass_catch_angle_deg must be positive")
+    if mission.ground_pass_search_orbits <= 0.0 or mission.ground_pass_search_step_seconds <= 0.0:
+        raise ValueError("ground-pass search horizon/step must be positive")
+    if mtq.max_dipole_Am2 <= 0.0 or mtq.time_constant_s <= 0.0 or mtq.minimum_field_t <= 0.0:
+        raise ValueError("magnetorquer dipole/time constant/minimum field must be positive")
+    if mtq.dipole_quantization_Am2 < 0.0 or mtq.bdot_gain_Am2_s_per_t < 0.0 or mtq.momentum_unload_gain_per_s < 0.0:
+        raise ValueError("magnetorquer quantization/gains must be non-negative")
     if orbit.earth_rotation_rate_rad_s < 0.0:
         raise ValueError("earth_rotation_rate_rad_s must be non-negative")
     if not 0.0 < fd.wheel_authority_ewma_alpha <= 1.0 or not 0.0 < fd.nis_ewma_alpha <= 1.0:
         raise ValueError("FDIR EWMA alphas must be in (0, 1]")
+    if fd.wheel_authority_window_seconds <= 0.0 or fd.wheel_authority_min_samples < 2:
+        raise ValueError("FDIR wheel authority window/min samples are invalid")
     if not 0.0 <= fd.wheel_failed_authority < fd.wheel_degraded_authority <= fd.wheel_recovery_authority <= 1.0:
         raise ValueError("FDIR wheel authority thresholds are inconsistent")
     if min(fd.wheel_suspect_samples, fd.wheel_fail_samples, fd.wheel_recovery_samples, fd.innovation_suspect_samples, fd.innovation_fail_samples, fd.sensor_recovery_samples) < 1:
@@ -503,6 +579,10 @@ def validate_config(config: ExperimentConfig) -> None:
         raise ValueError("minimum_control_wheels must be in [1,4]")
     if not 0.0 < sup.wheel_speed_degraded_fraction < sup.wheel_speed_critical_fraction <= 1.0:
         raise ValueError("supervisor wheel-speed fractions are inconsistent")
+    if not 0.0 < sup.momentum_unload_exit_fraction < sup.momentum_unload_enter_fraction < 1.0:
+        raise ValueError("momentum-unload thresholds are inconsistent")
+    if not 0.0 <= sup.detumble_exit_rate_deg_s < sup.detumble_enter_rate_deg_s:
+        raise ValueError("detumble rate thresholds are inconsistent")
     if min(sup.enter_degraded_dwell_seconds, sup.enter_safe_dwell_seconds, sup.recovery_dwell_seconds, sup.acquisition_dwell_seconds) < 0.0:
         raise ValueError("supervisor dwell times must be non-negative")
     if ppo.num_envs < 1 or ppo.num_minibatches < 1 or ppo.update_epochs < 1:

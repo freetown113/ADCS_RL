@@ -16,6 +16,11 @@ class EvaluationTrajectory(NamedTuple):
     target_omega_inertial: jax.Array
     omega: jax.Array
     wheel_speed: jax.Array
+    orbit_time_s: jax.Array
+    orbit_position_eci_m: jax.Array
+    orbit_velocity_eci_m_s: jax.Array
+    sun_direction_eci: jax.Array
+    sun_visible: jax.Array
     gyro_measurement: jax.Array
     wheel_speed_measurement: jax.Array
     star_tracker_measurement: jax.Array
@@ -24,6 +29,8 @@ class EvaluationTrajectory(NamedTuple):
     gnss_position_measurement: jax.Array
     gnss_velocity_measurement: jax.Array
     gnss_time_measurement: jax.Array
+    gyro_valid: jax.Array
+    wheel_valid: jax.Array
     star_tracker_valid: jax.Array
     magnetometer_valid: jax.Array
     sun_sensor_valid: jax.Array
@@ -46,6 +53,23 @@ class EvaluationTrajectory(NamedTuple):
     magnetometer_update_accepted: jax.Array
     sun_sensor_update_accepted: jax.Array
     wheel_mask: jax.Array
+    estimated_wheel_authority: jax.Array
+    wheel_motor_health: jax.Array
+    wheel_tach_health: jax.Array
+    star_health: jax.Array
+    magnetometer_health: jax.Array
+    sun_health: jax.Array
+    gnss_health: jax.Array
+    estimator_confidence: jax.Array
+    supervisory_mode: jax.Array
+    mission_phase: jax.Array
+    target_elevation_rad: jax.Array
+    target_reference_valid: jax.Array
+    target_in_beam: jax.Array
+    pointing_axis_error_rad: jax.Array
+    magnetorquer_commanded_dipole_Am2: jax.Array
+    magnetorquer_actual_dipole_Am2: jax.Array
+    magnetorquer_torque_body_Nm: jax.Array
     policy_action: jax.Array
     command_action: jax.Array
     reward: jax.Array
@@ -87,6 +111,11 @@ def rollout_command_controller(
             target_omega_inertial=next_state.target_omega_inertial,
             omega=next_state.physical.omega,
             wheel_speed=next_state.physical.wheel_speed,
+            orbit_time_s=next_state.orbit.time_s,
+            orbit_position_eci_m=next_state.orbit.position_eci_m,
+            orbit_velocity_eci_m_s=next_state.orbit.velocity_eci_m_s,
+            sun_direction_eci=next_state.orbit.sun_direction_eci,
+            sun_visible=next_state.orbit.sun_visible,
             gyro_measurement=info.gyro_measurement,
             wheel_speed_measurement=info.wheel_speed_measurement,
             star_tracker_measurement=info.star_tracker_measurement,
@@ -95,6 +124,8 @@ def rollout_command_controller(
             gnss_position_measurement=info.gnss_position_measurement,
             gnss_velocity_measurement=info.gnss_velocity_measurement,
             gnss_time_measurement=info.gnss_time_measurement,
+            gyro_valid=info.gyro_valid,
+            wheel_valid=info.wheel_valid,
             star_tracker_valid=info.star_tracker_valid,
             magnetometer_valid=info.magnetometer_valid,
             sun_sensor_valid=info.sun_sensor_valid,
@@ -117,6 +148,23 @@ def rollout_command_controller(
             magnetometer_update_accepted=info.magnetometer_update_accepted,
             sun_sensor_update_accepted=info.sun_sensor_update_accepted,
             wheel_mask=info.wheel_mask,
+            estimated_wheel_authority=info.estimated_wheel_authority,
+            wheel_motor_health=info.wheel_motor_health,
+            wheel_tach_health=info.wheel_tach_health,
+            star_health=info.star_health,
+            magnetometer_health=info.magnetometer_health,
+            sun_health=info.sun_health,
+            gnss_health=info.gnss_health,
+            estimator_confidence=info.estimator_confidence,
+            supervisory_mode=info.supervisory_mode,
+            mission_phase=info.mission_phase,
+            target_elevation_rad=info.target_elevation_rad,
+            target_reference_valid=info.target_reference_valid,
+            target_in_beam=info.target_in_beam,
+            pointing_axis_error_rad=info.pointing_axis_error_rad,
+            magnetorquer_commanded_dipole_Am2=info.magnetorquer_commanded_dipole_Am2,
+            magnetorquer_actual_dipole_Am2=info.magnetorquer_actual_dipole_Am2,
+            magnetorquer_torque_body_Nm=info.magnetorquer_torque_body_Nm,
             policy_action=zeros,
             command_action=command,
             reward=reward,
@@ -148,6 +196,11 @@ def evaluate_policy(
             target_omega_inertial=next_state.target_omega_inertial,
             omega=next_state.physical.omega,
             wheel_speed=next_state.physical.wheel_speed,
+            orbit_time_s=next_state.orbit.time_s,
+            orbit_position_eci_m=next_state.orbit.position_eci_m,
+            orbit_velocity_eci_m_s=next_state.orbit.velocity_eci_m_s,
+            sun_direction_eci=next_state.orbit.sun_direction_eci,
+            sun_visible=next_state.orbit.sun_visible,
             gyro_measurement=info.gyro_measurement,
             wheel_speed_measurement=info.wheel_speed_measurement,
             star_tracker_measurement=info.star_tracker_measurement,
@@ -156,6 +209,8 @@ def evaluate_policy(
             gnss_position_measurement=info.gnss_position_measurement,
             gnss_velocity_measurement=info.gnss_velocity_measurement,
             gnss_time_measurement=info.gnss_time_measurement,
+            gyro_valid=info.gyro_valid,
+            wheel_valid=info.wheel_valid,
             star_tracker_valid=info.star_tracker_valid,
             magnetometer_valid=info.magnetometer_valid,
             sun_sensor_valid=info.sun_sensor_valid,
@@ -178,6 +233,23 @@ def evaluate_policy(
             magnetometer_update_accepted=info.magnetometer_update_accepted,
             sun_sensor_update_accepted=info.sun_sensor_update_accepted,
             wheel_mask=info.wheel_mask,
+            estimated_wheel_authority=info.estimated_wheel_authority,
+            wheel_motor_health=info.wheel_motor_health,
+            wheel_tach_health=info.wheel_tach_health,
+            star_health=info.star_health,
+            magnetometer_health=info.magnetometer_health,
+            sun_health=info.sun_health,
+            gnss_health=info.gnss_health,
+            estimator_confidence=info.estimator_confidence,
+            supervisory_mode=info.supervisory_mode,
+            mission_phase=info.mission_phase,
+            target_elevation_rad=info.target_elevation_rad,
+            target_reference_valid=info.target_reference_valid,
+            target_in_beam=info.target_in_beam,
+            pointing_axis_error_rad=info.pointing_axis_error_rad,
+            magnetorquer_commanded_dipole_Am2=info.magnetorquer_commanded_dipole_Am2,
+            magnetorquer_actual_dipole_Am2=info.magnetorquer_actual_dipole_Am2,
+            magnetorquer_torque_body_Nm=info.magnetorquer_torque_body_Nm,
             policy_action=policy_action,
             command_action=command,
             reward=reward,
