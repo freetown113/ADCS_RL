@@ -38,7 +38,14 @@ class FDIRState(NamedTuple):
     wheel_speed_margin: jax.Array       # [B,4], 1 at zero speed -> 0 at limit
     estimator_confidence: jax.Array     # [B], 0..1
 
-    wheel_authority_ewma: jax.Array
+    # Sliding least-squares authority window. Each slot is one tachometer sample
+    # time; non-informative samples overwrite the slot with valid=0 so the window
+    # represents a real physical time horizon rather than an arbitrary sample count.
+    wheel_fit_x: jax.Array              # [B,4,N] predicted motor torque
+    wheel_fit_y: jax.Array              # [B,4,N] observed motor-equivalent torque
+    wheel_fit_valid: jax.Array          # [B,4,N] float weights 0/1
+    wheel_fit_index: jax.Array          # [B,4] circular slot per wheel
+    wheel_authority_ewma: jax.Array     # retained name: current regression estimate
     wheel_bad_count: jax.Array
     wheel_good_count: jax.Array
     wheel_tach_bad_count: jax.Array
@@ -91,6 +98,7 @@ def reset_fdir_state(
     sensors: SensorState,
     estimator: EstimatorState,
     config: FDIRConfig,
+    sensor_config: SensorConfig | None = None,
 ) -> FDIRState:
     batch = sensors.gyro.shape[0]
     h3 = jnp.full((batch, 3), HEALTHY, dtype=jnp.int32)
@@ -99,6 +107,9 @@ def reset_fdir_state(
     z4i = jnp.zeros((batch, 4), dtype=jnp.int32)
     zsi = jnp.zeros((batch,), dtype=jnp.int32)
     z4 = jnp.zeros((batch, 4), dtype=sensors.wheel_speed.dtype)
+    rate_hz = 100.0 if sensor_config is None else sensor_config.wheel_tach_rate_hz
+    window_slots = max(config.wheel_authority_min_samples, int(round(config.wheel_authority_window_seconds * rate_hz)))
+    zw = jnp.zeros((batch, 4, window_slots), dtype=sensors.wheel_speed.dtype)
     zs = jnp.zeros((batch,), dtype=sensors.gyro.dtype)
     return FDIRState(
         gyro_health=h3,
@@ -111,6 +122,10 @@ def reset_fdir_state(
         wheel_authority_estimate=jnp.ones((batch, 4), dtype=sensors.wheel_speed.dtype),
         wheel_speed_margin=jnp.ones((batch, 4), dtype=sensors.wheel_speed.dtype),
         estimator_confidence=_estimator_confidence(estimator, config),
+        wheel_fit_x=zw,
+        wheel_fit_y=zw,
+        wheel_fit_valid=zw,
+        wheel_fit_index=jnp.zeros((batch, 4), dtype=jnp.int32),
         wheel_authority_ewma=jnp.ones((batch, 4), dtype=sensors.wheel_speed.dtype),
         wheel_bad_count=z4i,
         wheel_good_count=z4i,
@@ -247,8 +262,6 @@ def update_fdir(
     measured_accel = (sensors.wheel_speed - state.previous_wheel_speed) / sample_dt
     predicted_friction = predicted_wheel_friction_torque(sensors.wheel_speed, physics)
     observed_motor_equivalent = physics.wheel_inertia * measured_accel + predicted_friction
-    authority_sample = (observed_motor_equivalent * predicted_motor) / (predicted_motor**2 + 1.0e-8)
-    authority_sample = jnp.clip(authority_sample, 0.0, 1.10)
 
     excitation = (
         new_wheel_sample
@@ -257,29 +270,48 @@ def update_fdir(
         & (jnp.abs(sensors.wheel_speed) <= config.wheel_speed_monitor_fraction * physics.max_wheel_speed)
         & (state.wheel_tach_health != FAILED)
     )
-    authority_ewma = jnp.where(
-        excitation,
-        (1.0 - config.wheel_authority_ewma_alpha) * state.wheel_authority_ewma
-        + config.wheel_authority_ewma_alpha * authority_sample,
-        state.wheel_authority_ewma,
+
+    slots = state.wheel_fit_x.shape[-1]
+    one_hot_slot = jax.nn.one_hot(state.wheel_fit_index, slots, dtype=dtype)
+    overwrite = one_hot_slot * new_wheel_sample[:, :, None].astype(dtype)
+    x_value = jnp.where(excitation, predicted_motor, 0.0)[:, :, None]
+    y_value = jnp.where(excitation, observed_motor_equivalent, 0.0)[:, :, None]
+    v_value = excitation.astype(dtype)[:, :, None]
+    fit_x = state.wheel_fit_x * (1.0 - overwrite) + x_value * overwrite
+    fit_y = state.wheel_fit_y * (1.0 - overwrite) + y_value * overwrite
+    fit_valid = state.wheel_fit_valid * (1.0 - overwrite) + v_value * overwrite
+    fit_index = jnp.where(
+        new_wheel_sample,
+        (state.wheel_fit_index + 1) % slots,
+        state.wheel_fit_index,
     )
-    authority_est = jnp.clip(authority_ewma, 0.0, 1.0)
-    wheel_bad = excitation & (authority_est < config.wheel_degraded_authority)
-    wheel_good = excitation & (authority_est >= config.wheel_recovery_authority)
+
+    numerator = jnp.sum(fit_valid * fit_x * fit_y, axis=-1)
+    denominator = jnp.sum(fit_valid * fit_x * fit_x, axis=-1)
+    sample_count = jnp.sum(fit_valid, axis=-1)
+    authority_fit = jnp.clip(numerator / (denominator + 1.0e-10), 0.0, 1.10)
+    fit_ready = sample_count >= config.wheel_authority_min_samples
+    authority_est = jnp.clip(jnp.where(fit_ready, authority_fit, state.wheel_authority_estimate), 0.0, 1.0)
+    authority_ewma = authority_est  # historical field name retained for checkpoint/debug compatibility
+
+    # Health persistence advances only when a fresh fit is available.
+    evidence_tick = new_wheel_sample & fit_ready
+    wheel_bad = evidence_tick & (authority_est < config.wheel_degraded_authority)
+    wheel_good = evidence_tick & (authority_est >= config.wheel_recovery_authority)
     wheel_terminal = jnp.where(
         authority_est <= config.wheel_failed_authority,
         jnp.full_like(state.wheel_motor_health, FAILED),
         jnp.full_like(state.wheel_motor_health, DEGRADED),
     )
     wheel_health, wheel_bad_count, wheel_good_count = _persistent_health(
-        state.wheel_motor_health,
-        wheel_bad,
-        wheel_good,
-        state.wheel_bad_count,
+        state.wheel_motor_health, 
+        wheel_bad, 
+        wheel_good, 
+        state.wheel_bad_count, 
         state.wheel_good_count,
-        config.wheel_suspect_samples,
-        config.wheel_fail_samples,
-        config.wheel_recovery_samples,
+        config.wheel_suspect_samples, 
+        config.wheel_fail_samples, 
+        config.wheel_recovery_samples, 
         wheel_terminal,
     )
     wheel_reason = jnp.where(
@@ -382,6 +414,10 @@ def update_fdir(
         wheel_authority_estimate=authority_est,
         wheel_speed_margin=jnp.clip(1.0 - jnp.abs(sensors.wheel_speed) / physics.max_wheel_speed, 0.0, 1.0),
         estimator_confidence=_estimator_confidence(estimator, config),
+        wheel_fit_x=fit_x,
+        wheel_fit_y=fit_y,
+        wheel_fit_valid=fit_valid,
+        wheel_fit_index=fit_index,
         wheel_authority_ewma=authority_ewma,
         wheel_bad_count=wheel_bad_count,
         wheel_good_count=wheel_good_count,

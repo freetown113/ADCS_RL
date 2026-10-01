@@ -12,14 +12,32 @@ from simulators.fdir.estimator import (
     reset_estimator_state,
 )
 from simulators.fdir.math3d import attitude_error, axis_angle_to_quat, sample_quaternion_in_cone, quat_multiply, rotate_body_to_inertial, rotate_inertial_to_body
-from simulators.fdir.guidance import GuidanceTarget, body_axis_vector, guidance_target, safe_sun_target, tracking_rate_error_body
+from simulators.fdir.guidance import GuidanceTarget, body_axis_vector, safe_sun_target, tracking_rate_error_body
 from simulators.fdir.fdir import FAILED, FDIRState, filter_sensors_for_estimator, reset_fdir_state, update_fdir
-from simulators.fdir.supervisor import SAFE_SUN, SupervisorState, mode_one_hot, reset_supervisor_state, update_supervisor
-from simulators.fdir.orbit import OrbitState, orbit_substep, reset_orbit_state
+from simulators.fdir.supervisor import DETUMBLE, MOMENTUM_UNLOAD, SAFE_SUN, SupervisorState, mode_one_hot, reset_supervisor_state, update_supervisor
+from simulators.fdir.orbit import OrbitState, orbit_state_at_time, orbit_substep
 from simulators.fdir.physics import (
     PhysicalState,
+    allocate_body_torque_command,
     physics_substep,
     physics_substep_motor_direct,
+)
+from simulators.fdir.reward import RewardTerms, compute_reward
+from simulators.fdir.mission import (
+    MissionState,
+    find_ground_pass_windows,
+    reset_mission_state,
+    select_ground_pass_start_times,
+    update_mission,
+    usable_ground_pass_start_intervals,
+)
+from simulators.fdir.magnetorquer import (
+    MagnetorquerState,
+    bdot_detumble_command,
+    magnetic_torque_body,
+    magnetorquer_substep,
+    momentum_unload_command,
+    reset_magnetorquer_state,
 )
 from simulators.fdir.reward import RewardTerms, compute_reward
 from simulators.fdir.sensors import (
@@ -37,6 +55,8 @@ class EnvState(NamedTuple):
     estimator: EstimatorState
     fdir: FDIRState
     supervisor: SupervisorState
+    mission: MissionState
+    magnetorquer: MagnetorquerState
     target_q: jax.Array
     target_omega_inertial: jax.Array
     wheel_mask: jax.Array
@@ -78,6 +98,11 @@ class StepInfo(NamedTuple):
     gnss_health: jax.Array
     estimator_confidence: jax.Array
     supervisory_mode: jax.Array
+    mission_phase: Array
+    target_elevation_rad: Array
+    magnetorquer_commanded_dipole_Am2: Array
+    magnetorquer_actual_dipole_Am2: Array
+    magnetorquer_torque_body_Nm: Array
     target_reference_valid: jax.Array
     pointing_axis_error_rad: jax.Array
     target_in_beam: jax.Array
@@ -89,6 +114,8 @@ class StepInfo(NamedTuple):
     gnss_position_measurement: jax.Array
     gnss_velocity_measurement: jax.Array
     gnss_time_measurement: jax.Array
+    gyro_valid: Array
+    wheel_valid: Array
     star_tracker_valid: jax.Array
     magnetometer_valid: jax.Array
     sun_sensor_valid: jax.Array
@@ -129,6 +156,21 @@ class SatelliteEnv:
         if self.episode_steps < 1:
             raise ValueError("episode_seconds must be at least one control step")
 
+        self._ground_pass_intervals = []
+        if (config.guidance.mode in ("ground_target", "ground_station")
+                and config.mission.ground_pass_enabled
+                and config.mission.ground_pass_reset_mode != "configured"):
+            windows = find_ground_pass_windows(config.orbit, config.guidance, config.mission)
+            self._ground_pass_intervals = usable_ground_pass_start_intervals(
+                windows, config.task.episode_seconds
+            )
+            if not self._ground_pass_intervals:
+                raise ValueError(
+                    "No ground-pass window can contain the complete episode above "
+                    "the configured entry elevation. Change orbit/target/episode or "
+                    "use ground_pass_reset_mode='configured'."
+                )
+
         obs_size = 3 + 3 + 4  # attitude vector, rate, wheel speed
         if config.observation.include_previous_action:
             obs_size += self.action_size
@@ -140,16 +182,16 @@ class SatelliteEnv:
             obs_size += 6
         self.observation_size = obs_size
 
-    def _commanded_guidance(self, orbit: OrbitState, supervisor_mode: jax.Array) -> GuidanceTarget:
-        mission = guidance_target(orbit, self.config.guidance, self.config.orbit)
+    def _safe_override(self, mission_target: GuidanceTarget, orbit: OrbitState, supervisor_mode: Array) -> GuidanceTarget:
         safe = safe_sun_target(orbit, self.config.guidance)
         use_safe = supervisor_mode == SAFE_SUN
         return GuidanceTarget(
-            q_body_to_inertial=jnp.where(use_safe[:, None], safe.q_body_to_inertial, mission.q_body_to_inertial),
-            omega_inertial_rad_s=jnp.where(use_safe[:, None], safe.omega_inertial_rad_s, mission.omega_inertial_rad_s),
-            reference_valid=jnp.where(use_safe, safe.reference_valid, mission.reference_valid),
-            reference_direction_eci=jnp.where(use_safe[:, None], safe.reference_direction_eci, mission.reference_direction_eci),
+            q_body_to_inertial=jnp.where(use_safe[:, None], safe.q_body_to_inertial, mission_target.q_body_to_inertial),
+            omega_inertial_rad_s=jnp.where(use_safe[:, None], safe.omega_inertial_rad_s, mission_target.omega_inertial_rad_s),
+            reference_valid=jnp.where(use_safe, safe.reference_valid, mission_target.reference_valid),
+            reference_direction_eci=jnp.where(use_safe[:, None], safe.reference_direction_eci, mission_target.reference_direction_eci),
         )
+
 
     def _sample_fault_wheel(self, key: jax.Array, batch_size: int) -> jax.Array:
         fault = self.config.faults
@@ -272,10 +314,15 @@ class SatelliteEnv:
 
     def reset(self, key: jax.Array, batch_size: int) -> EnvState:
         task = self.config.task
-        key_q, key_omega, key_fault, key_sensor = jax.random.split(key, 4)
+        key_q, key_omega, key_fault, key_sensor, key_mission = jax.random.split(key, 5)
 
-        orbit = reset_orbit_state(batch_size, self.config.orbit)
-        mission_target = guidance_target(orbit, self.config.guidance)
+        start_times = select_ground_pass_start_times(
+            key_mission, batch_size, self._ground_pass_intervals, task, self.config.mission
+        ) if self.config.guidance.mode in ("ground_target", "ground_station") else jnp.zeros((batch_size,), dtype=jnp.float32)
+        orbit = orbit_state_at_time(start_times, self.config.orbit)
+        mission_state, mission_target = reset_mission_state(
+            orbit, self.config.guidance, self.config.mission, self.config.physics, self.config.orbit
+        )
         target = mission_target
 
         if task.reset_mode == "fixed":
@@ -330,11 +377,12 @@ class SatelliteEnv:
             sensors, self.config.physics, self.config.sensors,
             self.config.orbit, self.config.estimator
         )
-        fdir = reset_fdir_state(sensors, estimator, self.config.fdir)
+        fdir = reset_fdir_state(sensors, estimator, self.config.fdir, self.config.sensors)
         supervisor = reset_supervisor_state(
             estimator, fdir, self.config.physics, self.config.fdir, self.config.supervisor
         )
-        target = self._commanded_guidance(orbit, supervisor.mode)
+        target = self._safe_override(mission_target, orbit, supervisor.mode)
+        magnetorquer = reset_magnetorquer_state(batch_size, q.dtype)
         return EnvState(
             physical=physical,
             orbit=orbit,
@@ -342,6 +390,8 @@ class SatelliteEnv:
             estimator=estimator,
             fdir=fdir,
             supervisor=supervisor,
+            mission=mission_state,
+            magnetorquer=magnetorquer,
             target_q=target.q_body_to_inertial,
             target_omega_inertial=target.omega_inertial_rad_s,
             wheel_mask=wheel_mask,
@@ -407,17 +457,27 @@ class SatelliteEnv:
             commanded_motor_torque = action * p.motor_control_limit
 
             def substep(carry, substep_index):
-                physical, orbit, sensors, estimator, fdir = carry
+                physical, orbit, sensors, estimator, fdir, magnetorquer = carry
+                det_cmd = bdot_detumble_command(sensors.gyro, sensors.magnetometer_body_t, self.config.magnetorquer)
+                unload_cmd, _ = momentum_unload_command(sensors.wheel_speed, sensors.magnetometer_body_t, p, self.config.magnetorquer)
+                mtq_command = jnp.where((state.supervisor.mode == DETUMBLE)[:, None], det_cmd, jnp.where((state.supervisor.mode == MOMENTUM_UNLOAD)[:, None], unload_cmd, 0.0))
+                next_magnetorquer = magnetorquer_substep(magnetorquer, mtq_command, p.physics_dt, self.config.magnetorquer)
+                true_b_body = rotate_inertial_to_body(physical.q, orbit.magnetic_field_eci_t)
+                mtq_torque = magnetic_torque_body(next_magnetorquer.actual_dipole_body_Am2, true_b_body)
+                predicted_mtq_torque = magnetic_torque_body(next_magnetorquer.actual_dipole_body_Am2, sensors.magnetometer_body_t)
+                ff_motor = allocate_body_torque_command(-predicted_mtq_torque, sensors.wheel_speed, fdir.wheel_authority_estimate, p)
+                base_motor_command = commanded_motor_torque + jnp.where((state.supervisor.mode == MOMENTUM_UNLOAD)[:, None], ff_motor, 0.0)
+                base_motor_command = jnp.where((state.supervisor.mode == DETUMBLE)[:, None], 0.0, base_motor_command)
                 flight_motor_command = jnp.where(
                     fdir.wheel_motor_health == FAILED,
                     0.0,
-                    commanded_motor_torque,
+                    base_motor_command,
                 )
                 next_physical, actuation = physics_substep_motor_direct(
                     physical,
                     flight_motor_command,
                     state.wheel_mask,
-                    external_body_torque,
+                    external_body_torque + mtq_torque,
                     p,
                 )
                 next_orbit = orbit_substep(orbit, p.physics_dt, self.config.orbit)
@@ -484,19 +544,28 @@ class SatelliteEnv:
                     ),
                 )
                 return (
-                    next_physical, next_orbit, next_sensors, next_estimator, next_fdir
-                ), (actuation, events)
+                    next_physical, next_orbit, next_sensors, next_estimator, next_fdir, next_magnetorquer
+                ), (actuation, events, mtq_command, next_magnetorquer.actual_dipole_body_Am2, mtq_torque)
         else:
             torque_limit = jnp.asarray(p.body_torque_limit, dtype=action.dtype)
             desired_body_torque = action * torque_limit
 
             def substep(carry, substep_index):
-                physical, orbit, sensors, estimator, fdir = carry
+                physical, orbit, sensors, estimator, fdir, magnetorquer = carry
+                det_cmd = bdot_detumble_command(sensors.gyro, sensors.magnetometer_body_t, self.config.magnetorquer)
+                unload_cmd, _ = momentum_unload_command(sensors.wheel_speed, sensors.magnetometer_body_t, p, self.config.magnetorquer)
+                mtq_command = jnp.where((state.supervisor.mode == DETUMBLE)[:, None], det_cmd, jnp.where((state.supervisor.mode == MOMENTUM_UNLOAD)[:, None], unload_cmd, 0.0))
+                next_magnetorquer = magnetorquer_substep(magnetorquer, mtq_command, p.physics_dt, self.config.magnetorquer)
+                true_b_body = rotate_inertial_to_body(physical.q, orbit.magnetic_field_eci_t)
+                mtq_torque = magnetic_torque_body(next_magnetorquer.actual_dipole_body_Am2, true_b_body)
+                predicted_mtq_torque = magnetic_torque_body(next_magnetorquer.actual_dipole_body_Am2, sensors.magnetometer_body_t)
+                body_command = desired_body_torque + jnp.where((state.supervisor.mode == MOMENTUM_UNLOAD)[:, None], -predicted_mtq_torque, 0.0)
+                body_command = jnp.where((state.supervisor.mode == DETUMBLE)[:, None], 0.0, body_command)
                 next_physical, actuation = physics_substep(
                     physical,
-                    desired_body_torque,
+                    body_command,
                     fdir.wheel_authority_estimate,
-                    external_body_torque,
+                    external_body_torque + mtq_torque,
                     p,
                     measured_wheel_speed=sensors.wheel_speed,
                     physical_wheel_authority=state.wheel_mask,
@@ -565,8 +634,8 @@ class SatelliteEnv:
                     ),
                 )
                 return (
-                    next_physical, next_orbit, next_sensors, next_estimator, next_fdir
-                ), (actuation, events)
+                    next_physical, next_orbit, next_sensors, next_estimator, next_fdir, next_magnetorquer
+                ), (actuation, events, mtq_command, next_magnetorquer.actual_dipole_body_Am2, mtq_torque)
 
         (
             next_physical,
@@ -574,9 +643,10 @@ class SatelliteEnv:
             next_sensors,
             next_estimator,
             next_fdir,
-        ), (actuation_sequence, estimator_events) = jax.lax.scan(
+            next_magnetorquer,
+        ), (actuation_sequence, estimator_events, mtq_command_sequence, mtq_actual_sequence, mtq_torque_sequence) = jax.lax.scan(
             substep,
-            (state.physical, state.orbit, state.sensors, state.estimator, state.fdir),
+            (state.physical, state.orbit, state.sensors, state.estimator, state.fdir, state.magnetorquer),
             substep_indices,
         )
 
@@ -584,7 +654,10 @@ class SatelliteEnv:
         next_supervisor = update_supervisor(
             state.supervisor, next_estimator, next_fdir, p, self.config.fdir, self.config.supervisor
         )
-        next_target = self._commanded_guidance(next_orbit, next_supervisor.mode)
+        next_mission, mission_target = update_mission(
+            state.mission, next_orbit, self.config.guidance, self.config.mission, p, self.config.orbit
+        )
+        next_target = self._safe_override(mission_target, next_orbit, next_supervisor.mode)
         previous_error_q = attitude_error(state.target_q, state.physical.q)
         error_q = attitude_error(next_target.q_body_to_inertial, next_physical.q)
         true_rate_error = tracking_rate_error_body(
@@ -621,6 +694,8 @@ class SatelliteEnv:
             estimator=next_estimator,
             fdir=next_fdir,
             supervisor=next_supervisor,
+            mission=next_mission,
+            magnetorquer=next_magnetorquer,
             target_q=next_target.q_body_to_inertial,
             target_omega_inertial=next_target.omega_inertial_rad_s,
             wheel_mask=next_mask,
@@ -682,6 +757,11 @@ class SatelliteEnv:
             gnss_health=next_fdir.gnss_health,
             estimator_confidence=next_fdir.estimator_confidence,
             supervisory_mode=next_supervisor.mode,
+            mission_phase=next_mission.phase,
+            target_elevation_rad=next_mission.target_elevation_rad,
+            magnetorquer_commanded_dipole_Am2=mtq_command_sequence[-1],
+            magnetorquer_actual_dipole_Am2=mtq_actual_sequence[-1],
+            magnetorquer_torque_body_Nm=mtq_torque_sequence[-1],
             target_reference_valid=next_target.reference_valid,
             pointing_axis_error_rad=pointing_axis_error,
             target_in_beam=target_in_beam,
@@ -693,6 +773,8 @@ class SatelliteEnv:
             gnss_position_measurement=next_sensors.gnss_position_eci_m,
             gnss_velocity_measurement=next_sensors.gnss_velocity_eci_m_s,
             gnss_time_measurement=next_sensors.gnss_time_s,
+            gyro_valid=next_sensors.gyro_valid,
+            wheel_valid=next_sensors.wheel_valid,
             star_tracker_valid=next_sensors.star_tracker_valid,
             magnetometer_valid=next_sensors.magnetometer_valid,
             sun_sensor_valid=next_sensors.sun_sensor_valid,

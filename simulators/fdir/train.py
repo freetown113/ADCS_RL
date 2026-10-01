@@ -156,17 +156,21 @@ def train(config: ExperimentConfig) -> TrainState:
                 )
 
             if config.run.video_every > 0 and update_index % config.run.video_every == 0:
-                from .video import save_policy_video
+                from .video import save_policy_video, save_policy_video_bundle
 
                 one_state = env.reset(fixed_eval_key, 1)
-                save_policy_video(
-                    env=env,
-                    params=train_state.params,
-                    apply_fn=network.apply,
-                    initial_state=one_state,
-                    output_path=output_dir / "videos" / f"update_{update_index:07d}.mp4",
-                    title=f"PPO update {update_index}",
-                )
+                base = output_dir / "videos" / f"update_{update_index:07d}"
+                if config.run.video_diagnostic_pages:
+                    save_policy_video_bundle(
+                        env=env, params=train_state.params, apply_fn=network.apply,
+                        initial_state=one_state, output_base=base, title=f"PPO update {update_index}",
+                    )
+                else:
+                    save_policy_video(
+                        env=env, params=train_state.params, apply_fn=network.apply,
+                        initial_state=one_state, output_path=base.with_suffix(".mp4"),
+                        title=f"PPO update {update_index}",
+                    )
     except Exception as ex:
         print(f'Failed to train agent, caused by {ex}')
 
@@ -232,6 +236,17 @@ def parse_config() -> ExperimentConfig:
     parser.add_argument("--sun-sensor-eclipse", action="store_true")
     parser.add_argument("--orbit-altitude-m", type=float, default=None)
     parser.add_argument("--orbit-inclination-deg", type=float, default=None)
+    parser.add_argument("--orbit-raan-deg", type=float, default=None)
+    parser.add_argument("--orbit-argument-latitude-deg", type=float, default=None)
+    parser.add_argument("--ground-pass-reset-mode", choices=["configured", "pass_centered", "random_visible"], default=None)
+    parser.add_argument("--ground-pass-enter-elevation-deg", type=float, default=None)
+    parser.add_argument("--ground-pass-exit-elevation-deg", type=float, default=None)
+    parser.add_argument("--ground-pass-slew-max-rate-deg-s", type=float, default=None)
+    parser.add_argument("--ground-pass-slew-max-accel-deg-s2", type=float, default=None)
+    parser.add_argument("--enable-auto-detumble", action="store_true")
+    parser.add_argument("--disable-auto-momentum-unload", action="store_true")
+    parser.add_argument("--disable-magnetorquer", action="store_true")
+    parser.add_argument("--video-diagnostic-pages", action="store_true")
     parser.add_argument("--disable-estimator", action="store_true")
     parser.add_argument("--disable-star-tracker-update", action="store_true")
     parser.add_argument("--disable-magnetometer-update", action="store_true")
@@ -389,6 +404,28 @@ def parse_config() -> ExperimentConfig:
                 config.orbit, inclination_deg=args.orbit_inclination_deg
             )
         )
+    if args.orbit_raan_deg is not None:
+        config = replace(config, orbit=replace(config.orbit, raan_deg=args.orbit_raan_deg))
+    if args.orbit_argument_latitude_deg is not None:
+        config = replace(config, orbit=replace(config.orbit, initial_argument_of_latitude_deg=args.orbit_argument_latitude_deg))
+    mission_overrides = {
+        "ground_pass_reset_mode": args.ground_pass_reset_mode,
+        "ground_pass_enter_elevation_deg": args.ground_pass_enter_elevation_deg,
+        "ground_pass_exit_elevation_deg": args.ground_pass_exit_elevation_deg,
+        "ground_pass_slew_max_rate_deg_s": args.ground_pass_slew_max_rate_deg_s,
+        "ground_pass_slew_max_accel_deg_s2": args.ground_pass_slew_max_accel_deg_s2,
+    }
+    for name, value in mission_overrides.items():
+        if value is not None:
+            config = replace(config, mission=replace(config.mission, **{name: value}))
+    if args.enable_auto_detumble:
+        config = replace(config, supervisor=replace(config.supervisor, autonomous_detumble_enabled=True))
+    if args.disable_auto_momentum_unload:
+        config = replace(config, supervisor=replace(config.supervisor, autonomous_momentum_unload_enabled=False))
+    if args.disable_magnetorquer:
+        config = replace(config, magnetorquer=replace(config.magnetorquer, enabled=False))
+    if args.video_diagnostic_pages:
+        config = replace(config, run=replace(config.run, video_diagnostic_pages=True))
     if args.disable_estimator:
         config = replace(
             config, estimator=replace(config.estimator, enabled=False)
