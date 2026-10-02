@@ -1,9 +1,16 @@
-This project aims to train a reinforcement learning agent capable of fully controlling a satellite’s Attitude Determination and Control System (ADCS). The system uses three orthogonal reaction wheels to provide full three-axis control, while a fourth wheel is added as a backup, creating a redundant configuration.
+# Learning to control satellite's attitude
 
-The project focuses on the following key elements:
-
- - Reaction Wheels (RWs): Electric motors equipped with flywheels that accelerate or decelerate to generate precise torque through angular momentum exchange.
- - Three-Axis Stabilization: An active attitude-control method enabled by the reaction wheel configuration.
- - Redundant Configuration: A 3+1 setup, also known as a pyramid architecture, in which the fourth wheel operates as part of the regular control system, reducing the load on the three primary wheels. If one of the primary wheels fails, the fourth wheel can take over its function, ensuring system redundancy.
+## This project present an ADCS simulation and verification project with learned reaction-wheel control
 
 
+The project evolves, current stage demonstrates a satellite's attitude control subsystem. It does not yet demonstrate docking or manipulation. Principal milestones are described in project_evolution.md file. 
+
+
+### Train agent from scratch
+python -m simulators.fdir.train --guidance-mode ground_station --target-lat-deg 8.49 --target-lon-deg -13.23 --orbit-inclination-deg 10.0 --orbit-raan-deg 288.93 --orbit-argument-latitude-deg 58.23 --ground-pass-reset-mode pass_centered
+
+### Train agent from checkpoint
+python -m simulators.fdir.train --guidance-mode ground_station --target-lat-deg 8.49 --target-lon-deg -13.23 --orbit-inclination-deg 10.0 --orbit-raan-deg 288.93 --orbit-argument-latitude-deg 58.23 --ground-pass-reset-mode random_visible --load-from-existing satellite_reference/checkpoints/update_0009650.pkl
+
+### Evaluate agent
+python -m simulators.fdir.evaluate_checkpoint atellite_reference/checkpoints/update_0009650.pkl --video eval_output/agent_ground_station_performance.mp4 --eval-envs 10
