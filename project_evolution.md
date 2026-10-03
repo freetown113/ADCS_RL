@@ -1,3 +1,252 @@
+# Milestone B.3 — Ground-pass supervision, and magnetic momentum management
+
+There are three principal aupdates since previous milestone:
+1. ground-target/ground-station missions are scheduled through a pass manager instead of a stateless horizon switch, fixing target in sight/lost chattering problem. 
+2. reaction-wheel authority is estimated from a sliding-window regression rather than a single differentiated tachometer sample.
+3. conventional three-axis magnetorquers provide a real external torque for `DETUMBLE` and `MOMENTUM_UNLOAD`.
+
+It also adds separate telemetry/FDIR and mission-geometry video pages.
+
+## Ground-target command chatter fix
+
+Near the numerical/geometric boundary, a small change in orbit state can change the Boolean result. More importantly, the two reference quaternions can be very far apart. A one-tick Boolean change therefore becomes a one-tick reference change. Now geometric visibility is separated from mission phase.
+The pass manager uses different entry and exit elevations. This is amplitude hysteresis. Both conditions also require dwell time, which adds temporal hysteresis. The state path is:
+```
+STANDBY -> PRE_SLEW -> TRACK -> POST_SLEW -> STANDBY.
+```
+A reference never switches directly from ground tracking to fallback.
+
+
+## Rate/acceleration-limited AOS/LOS transitions
+
+Merely SLERPing continuously is not sufficient: a 170-degree quaternion difference blended in two seconds is continuous but physically much too fast.
+
+B.3 moves the commanded reference toward the current endpoint with
+
+$$
+0 \le \omega_{\text{slew}} \le \omega_{\max}
+$$
+
+and a scalar acceleration bound
+
+$$
+|\Delta \omega_{\text{slew}}| \le \alpha_{\max}\Delta t.
+$$
+
+The stopping-speed bound is
+
+$$
+\omega_{\text{stop}}
+=
+\sqrt{2\alpha_{\max}\theta_{\text{remaining}}}.
+$$
+
+The requested slew speed is
+
+$$
+\omega_{\text{req}}
+=
+\min\left(\omega_{\max},\omega_{\text{stop}}\right).
+$$
+
+This gives accelerate/cruise/decelerate behavior while still pursuing a slowly moving endpoint such as the ground LOS or LVLH frame.
+
+`PRE_SLEW -> TRACK` occurs only when:
+
+1. the target has remained above the entry elevation for the configured dwell; and
+2. the rate-limited reference has actually caught the moving ground reference.
+
+`POST_SLEW -> STANDBY` similarly waits until the fallback attitude has actually been reached.
+
+Therefore AOS/LOS cannot create a hidden quaternion discontinuity.
+
+## Windowed reaction-wheel authority estimation
+
+B.2 differentiated two adjacent tachometer samples and formed an instantaneous authority observation. With realistic tachometer noise/quantization, that derivative can be noisy.
+
+B.3 collects a physical window of informative samples. For sample $k$ define
+
+$$
+x_k=\tau_{\text{motor,pred},k}
+$$
+
+and
+
+$$
+y_k=
+J_w
+\frac{\omega_{w,k}-\omega_{w,k-1}}{\Delta t_k}
++
+\tau_{\text{friction,pred},k}.
+$$
+
+Assume over a short window that
+
+$$
+y_k\approx a x_k + \epsilon_k,
+$$
+
+where $a$ is effective wheel motor authority. The least-squares estimate is
+
+$$
+\boxed{
+\hat a =
+\frac{\sum_k x_k y_k}
+{\sum_k x_k^2+\epsilon}
+}
+$$
+
+and is clipped to the physical belief interval used by control.
+
+The default window is
+
+```text
+0.40 s at 100-Hz tachometer rate -> 40 slots
+```
+
+and at least 12 informative samples are required before replacing the previous belief.
+
+A sample is informative only when:
+
+- it is a new valid tachometer sample;
+- predicted motor torque exceeds `wheel_min_excitation_torque`;
+- the wheel is not close to speed saturation;
+- the tachometer is not already isolated as failed.
+
+"Excitation" simply means that the commanded input is large enough that a healthy and failed channel should produce measurably different outputs. A zero-torque command cannot tell us whether a motor is alive.
+
+The window gives a much better signal-to-noise ratio than treating one differentiated tach sample as a diagnosis.
+
+
+## Magnetorquer physics
+
+A magnetic torquer commands body magnetic dipole $\mathbf m$. The local geomagnetic field is $\mathbf B$, giving
+
+$$
+\boxed{
+\boldsymbol\tau_{MTQ}=\mathbf m\times\mathbf B
+}
+$$
+
+The plant uses the true simulated $\mathbf B$ only for this physical torque. Flight laws use delivered magnetometer telemetry.
+
+Instantaneously,
+
+$$
+\boldsymbol\tau_{MTQ}\cdot\mathbf B=0,
+$$
+
+so magnetic torque has only two-dimensional authority at one instant. Over an orbit the field direction changes, making three-axis momentum management possible over time.
+
+The actuator includes commanded-dipole quantization, maximum dipole and first-order dipole dynamics.
+
+
+## `DETUMBLE`
+
+`DETUMBLE` is intended for rates too high for normal acquisition/fine pointing. It uses a gyro-aided B-dot approximation.
+
+For body rotation dominating the local field derivative,
+
+$$
+\dot{\mathbf B}_b\approx-\boldsymbol\omega_b\times\mathbf B_b.
+$$
+
+The commanded dipole is
+
+$$
+\boxed{
+\mathbf m=-k_B\dot{\mathbf B}_b
+}
+$$
+
+or equivalently using the approximation above,
+
+$$
+\mathbf m\approx k_B(\boldsymbol\omega_b\times\mathbf B_b).
+$$
+
+This produces a torque that damps the component of angular velocity perpendicular to the magnetic field.
+
+While the supervisor is in `DETUMBLE`, the RL/reaction-wheel mission command is inhibited; magnetic control is responsible for rate reduction. `autonomous_detumble_enabled` defaults to `False` so existing controller-training experiments are not silently replaced by a different high-rate strategy. Enable it for integrated mission simulation.
+
+
+## `MOMENTUM_UNLOAD`
+
+Wheel cluster momentum estimated from tachometers is
+
+$$
+\boxed{
+\mathbf h_w=A J_w\boldsymbol\omega_w.
+}
+$$
+
+A desired external unloading torque is
+
+$$
+\boldsymbol\tau^*=-k_h\mathbf h_w.
+$$
+
+Because magnetic torque must be perpendicular to $\mathbf B$, define
+
+$$
+\hat{\mathbf b}=\frac{\mathbf B}{\|\mathbf B\|},
+$$
+
+$$
+P_\perp=I-\hat{\mathbf b}\hat{\mathbf b}^T,
+$$
+
+$$
+\boldsymbol\tau_{dump}=P_\perp\boldsymbol\tau^*.
+$$
+
+A dipole that realizes this achievable torque is
+
+$$
+\boxed{
+\mathbf m=
+\frac{\mathbf B\times\boldsymbol\tau_{dump}}
+{\|\mathbf B\|^2}.
+}
+$$
+
+During unloading, reaction wheels receive an equal-and-opposite body-torque feed-forward
+
+$$
+\boldsymbol\tau_{rw,ff}=-\boldsymbol\tau_{MTQ}.
+$$
+
+The body can therefore remain approximately pointed while the *external* magnetic torque changes total spacecraft angular momentum and the wheel cluster moves away from saturation.
+
+The supervisor enters unloading at the high wheel-speed threshold and exits only below a lower threshold, with dwell timers. This is both amplitude and time hysteresis.
+
+### Current fidelity boundary
+
+A real spacecraft often avoids using magnetic-torquer coils at exactly the same instant that a sensitive magnetometer is sampled, because the commanded spacecraft magnetic field contaminates the measurement. B.3 does **not yet** model this self-field interference or torquer/magnetometer duty cycling. This is an appropriate next magnetics-fidelity improvement.
+
+
+## Supervisory modes after B.3
+
+### `DETUMBLE`
+Reduce high angular rate with magnetic control before fine sensors/control are trusted.
+
+### `ATTITUDE_ACQUIRE`
+Rates are manageable but the estimator has not yet established sufficiently confident global attitude knowledge. Gyro propagation plus available absolute/vector sensors build confidence.
+
+### `FINE_POINTING`
+Nominal estimator and actuator authority. Use mission guidance with normal pointing limits/performance.
+
+### `DEGRADED_POINTING`
+Continue the mission with reduced wheel/sensor capability where controllability and estimator confidence remain adequate.
+
+### `SAFE_SUN`
+Leave the nominal mission objective and command a robust power-positive Sun reference after severe estimator/actuator degradation.
+
+### `MOMENTUM_UNLOAD`
+Use external magnetic torque plus wheel counter-torque to reduce wheel momentum before speed saturation. In a later architecture this may become an orthogonal momentum-management state that can coexist with a pointing mode; B.3 keeps it in the supervisor enum for simplicity.
+
+
+
 # Milestone B.2 — FDIR, supervisory GNC, and mission guidance
 
 This milestone starts the transition from a sensor-realistic simulator to a 
