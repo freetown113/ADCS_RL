@@ -89,9 +89,10 @@ python3 -m optimization.adcs_embed.manifest approve \
     --binary-sha256 ***2*** ***3*** \
     --out contracts/approved.json
 ```
-# --actor-sha256: replace ***1*** with SHA256 code located in `quantized/output/export_groups/w8a8hi/model.json`
-# --binary-sha256: replace ***2*** with output of `sha256sum quantized/output/export_groups/w8a8hi/actor.bin` command
-# --binary-sha256: replace ***3*** with output of `sha256sum quantized/output/export_groups/w8a32/actor.bin` command
+#### --actor-sha256: replace ***1*** with SHA256 code located in `quantized/output/export_groups/w8a8hi/model.json`
+#### --binary-sha256: replace ***2*** with output of `sha256sum quantized/output/export_groups/w8a8hi/actor.bin` command
+#### --binary-sha256: replace ***3*** with output of `sha256sum quantized/output/export_groups/w8a32/actor.bin` command
+
 
 
 ```
