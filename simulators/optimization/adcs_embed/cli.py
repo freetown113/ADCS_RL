@@ -39,7 +39,7 @@ def load_actor(path):
         a = extract_haiku_actor(checkpoint['params'], hidden_count=len(cfg['hidden_sizes']),
                                 activation=cfg['activation'], mean_limit=cfg['policy_mean_limit'])
     else: 
-        raise ValueError('actor file must be trusted B4 .pkl or standalone .npz')
+        raise ValueError('actor file must be trusted .pkl or standalone .npz')
     a.validate()
     return a
 
@@ -70,12 +70,14 @@ def main(argv=None):
     x.add_argument('--out', required=True)
     x.add_argument('--percentile',type=float,default=100.)
     x.add_argument('--margin',type=float,default=1.05)
+    x.add_argument('--input-group-edges',type=int,nargs='+',default=None,
+                   help='Contiguous boundaries, e.g. 0 6 18 (default for 18-input actor)')
     x=sub.add_parser('export',help='Export all or selected precision variants as binary models')
     x.add_argument('actor')
     x.add_argument('--calibration',required=True)
     x.add_argument('--out',required=True)
     x.add_argument('--variants',nargs='+',choices=VARIANTS,default=list(VARIANTS))
-    x=sub.add_parser('benchmark',help='Held-out open-loop tests; not a closed-loop success benchmark')
+    x=sub.add_parser('benchmark',help='Held-out open-loop tests, not a closed-loop success benchmark')
     x.add_argument('actor')
     x.add_argument('observations')
     x.add_argument('--models',required=True)
@@ -94,7 +96,8 @@ def main(argv=None):
     elif args.command=='calibrate':
         a=load_actor(args.actor)
         obs=observations_from_file(args.observations)
-        cal=calibrate(a,obs,percentile=args.percentile,margin=args.margin)
+        cal=calibrate(a,obs,percentile=args.percentile,margin=args.margin, 
+                      input_group_edges=args.input_group_edges)
 
         if Path(args.observations).suffix=='.npz':
             with np.load(args.observations,allow_pickle=False) as z:
@@ -128,7 +131,7 @@ def main(argv=None):
             directory=root/variant
             directory.mkdir(parents=True,exist_ok=True)
             size=save_binary(m,directory/'actor.bin')
-            write_metadata(directory/'model.json',m,calibration=c if variant=='w8a8' else None,
+            write_metadata(directory/'model.json',m,calibration=c if variant in ('w8a8','w8a8hi') else None,
                            origin={'source':str(args.actor),'actor_sha256':actor_sha256,
                                    'calibration_sha256':hashlib.sha256(Path(args.calibration).read_bytes()).hexdigest()})
 
@@ -163,8 +166,15 @@ def main(argv=None):
                 t=time.perf_counter_ns()
                 predict(model,single)
                 times.append((time.perf_counter_ns()-t)/1000)
+            if variant == 'w8a8':
+                clip = float(np.mean(np.abs(obs) > model.layers[0].input_scale * 127.))
+                group_clips = None
+            else:
+                clip = None
+                group_clips = None
             row=dict(variant=variant,binary_bytes=f.stat().st_size,
-                     heldout_input_clip_fraction=(float(np.mean(np.abs(obs)>model.layers[0].input_scale*127)) if variant=='w8a8' else None),
+                     heldout_input_clip_fraction=clip,
+                     heldout_input_group_clip_fractions=(json.dumps(group_clips) if group_clips is not None else None),
                      numpy_batch_us_per_obs=batch_us,
                      numpy_single_p50_us=float(np.median(times)),
                      numpy_single_p99_us=float(np.percentile(times,99)),

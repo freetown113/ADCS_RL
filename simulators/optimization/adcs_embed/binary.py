@@ -28,18 +28,20 @@ def save_binary(model: QuantActor, path):
         data.extend(struct.pack('<II', n, m))
         mode = model.variant
         w_dtype = '<f4' if mode == 'fp32' else '<f2' if mode == 'fp16' else '<u2' if mode == 'bf16' else 'i1'
-        b_dtype = '<i4' if mode == 'w8a8' else '<f2' if mode == 'fp16' else '<u2' if mode == 'bf16' else '<f4'
+        b_dtype = '<i4' if (mode == 'w8a8' or mode in 'w8a8hi' and layer.input_scale is not None) else '<f2' if mode == 'fp16' else '<u2' if mode == 'bf16' else '<f4'
         data.extend(np.asarray(layer.weight, dtype=w_dtype).tobytes(order='C'))
         data.extend(np.asarray(layer.bias, dtype=b_dtype).tobytes(order='C'))
-        if mode in ('w8a32', 'w8a16', 'w8a8'):
+        if mode.startswith('w8'):
             scales = np.asarray(layer.weight_scales, dtype='<f4')
             if scales.shape != (m,) or not np.all(np.isfinite(scales)) or np.any(scales <= 0):
                 raise ValueError('bad weight scales')
             data.extend(scales.tobytes())
-            if mode == 'w8a8':
+            if mode in ('w8a8', 'w8a8hi') and layer.input_scale is not None:
                 if layer.input_scale is None or not np.isfinite(layer.input_scale) or layer.input_scale <= 0:
                     raise ValueError('bad input scale')
                 data.extend(struct.pack('<f', layer.input_scale))
+            elif mode in ('w8a8', 'w8a8hi') and not mode == 'w8a8hi':
+                raise ValueError('missing quantization input scale/groups')
         prev = m
 
     data.extend(struct.pack('<I', zlib.crc32(data) & 0xffffffff))
@@ -90,23 +92,21 @@ def load_binary(path) -> QuantActor:
         if not (1 <= n <= 8192 and 1 <= m <= 8192) or (prev is not None and n != prev):
             raise ValueError('invalid Dense dimensions')
         wt = '<f4' if variant == 'fp32' else '<f2' if variant == 'fp16' else '<u2' if variant == 'bf16' else 'i1'
-        bt = '<i4' if variant == 'w8a8' else '<f2' if variant == 'fp16' else '<u2' if variant == 'bf16' else '<f4'
+        bt = '<i4' if (variant == 'w8a8' or variant in 'w8a8hi' and len(layers) > 0) else '<f2' if variant == 'fp16' else '<u2' if variant == 'bf16' else '<f4'
         w = array(n*m, wt).reshape(n, m)
         b = array(m, bt)
         ws = array(m, '<f4') if variant.startswith('w8') else None
-        xs = take('<f')[0] if variant == 'w8a8' else None
-        if ws is not None and (not np.isfinite(ws).all() or np.any(ws <= 0)): 
-            raise ValueError('bad scales')
+        groups = None
+        first = len(layers) == 0
+
+        xs = take('<f')[0] if (variant == 'w8a8' or
+                              variant in 'w8a8hi' and not first) else None
+        if ws is not None and (not np.isfinite(ws).all() or np.any(ws <= 0)): raise ValueError('bad scales')
         if xs is not None:
-            if not np.isfinite(xs) or xs <= 0: 
-                raise ValueError('bad scale')
-            if np.any(127*127*n + np.abs(b.astype(np.int64)) >= 2**31): 
-                raise ValueError('potential int32 overflow')
-        layers.append(QuantDense(w, b, ws, xs))
-        prev = m
-    if cursor != len(data)-4: 
-        raise ValueError('unexpected trailing payload')
-    
+            if not np.isfinite(xs) or xs <= 0: raise ValueError('bad scale')
+            if np.any(127*127*n + np.abs(b.astype(np.int64)) >= 2**31): raise ValueError('potential int32 overflow')
+        layers.append(QuantDense(w, b, ws, xs, groups)); prev = m
+    if cursor != len(data)-4: raise ValueError('unexpected trailing payload')
     return QuantActor(layers, variant, ('tanh','relu')[act], float(limit))
 
 
@@ -120,6 +120,8 @@ def write_metadata(path, model, *, calibration=None, origin=None):
         'action_contract': 'action=tanh(limit*tanh(raw/limit))',
         'w8a16_note': 'FP16 activations, dequantized FP16 weights, FP32 sum',
         'calibration': calibration, 'origin': origin,
+        'input_groups': model.layers[0].input_groups,
+        'mode_note': 'w8a8hi: FP32 input × dequantized W8 first layer; later W8A8' if model.variant=='w8a8hi' else None,
         'binary_model': 'actor.bin',
     }
 
